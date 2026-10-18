@@ -1,0 +1,16 @@
+[package]
+name = "warm_core"
+version = "0.1.0"
+edition = "2024"
+description = "Пул потоков, который держит работу на физическом ядре, чтобы L1/L2 оставались тёплыми"
+publish = false
+
+[dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "locality"
+harness = false
