@@ -30,6 +30,11 @@ pub struct Config {
     pub layout: Layout,
     /// Сколько локальных задач выполнить подряд, прежде чем смотреть на чужие очереди.
     pub batch: usize,
+    /// Сколько закреплённых задач подряд взять, прежде чем отдать слот общей очереди.
+    ///
+    /// `1` чередует очереди поровну. Значение меньше единицы [`Pool::with_config`] поднимает до 1.
+    /// Счётчик серии не обнуляется на границе пачки.
+    pub pinned_per_shared: usize,
 }
 
 impl Default for Config {
@@ -37,6 +42,7 @@ impl Default for Config {
         Self {
             layout: Layout::PhysicalCores,
             batch: 32,
+            pinned_per_shared: 3,
         }
     }
 }
@@ -71,6 +77,7 @@ struct Worker {
 struct Inner {
     workers: Vec<Worker>,
     batch: usize,
+    pinned_per_shared: usize,
     shutdown: AtomicBool,
     rr: AtomicUsize,
 }
@@ -103,10 +110,14 @@ impl Pool {
 
     pub fn with_config(config: Config) -> io::Result<Self> {
         let topology = Topology::detect()?;
-        Self::from_cpus(select_cpus(&topology, config.layout), config.batch.max(1))
+        Self::from_cpus(
+            select_cpus(&topology, config.layout),
+            config.batch.max(1),
+            config.pinned_per_shared.max(1),
+        )
     }
 
-    fn from_cpus(cpus: Vec<Cpu>, batch: usize) -> io::Result<Self> {
+    fn from_cpus(cpus: Vec<Cpu>, batch: usize, pinned_per_shared: usize) -> io::Result<Self> {
         if cpus.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -128,6 +139,7 @@ impl Pool {
         let inner = Arc::new(Inner {
             workers,
             batch,
+            pinned_per_shared,
             shutdown: AtomicBool::new(false),
             rr: AtomicUsize::new(0),
         });
@@ -322,8 +334,11 @@ fn worker_entry(inner: Arc<Inner>, index: usize, started: Sender<io::Result<()>>
 }
 
 fn worker_loop(inner: &Inner, index: usize) {
+    // Серия живёт дольше пачки: иначе `batch == 1` при квоте 3 снова
+    // отдавал бы каждый слот закреплённой очереди.
+    let mut pinned_streak = 0;
     loop {
-        if run_local_batch(inner, index) {
+        if run_local_batch(inner, index, &mut pinned_streak) {
             continue;
         }
         if let Some(task) = steal(inner, index) {
@@ -333,7 +348,7 @@ fn worker_loop(inner: &Inner, index: usize) {
         if inner.shutdown.load(Ordering::Acquire) {
             // Drop забирает `&mut Pool`, поэтому новых execute уже нет.
             // Повторный обход доедает то, что уже лежит в очередях.
-            if run_local_batch(inner, index) {
+            if run_local_batch(inner, index, &mut pinned_streak) {
                 continue;
             }
             if let Some(task) = steal(inner, index) {
@@ -346,13 +361,31 @@ fn worker_loop(inner: &Inner, index: usize) {
     }
 }
 
-/// Сначала закреплённые задачи этого ядра, потом своя общая очередь.
-/// Чужая очередь здесь не читается.
-fn run_local_batch(inner: &Inner, index: usize) -> bool {
+/// Своя закреплённая и своя общая очередь делят пачку: `pinned_per_shared`
+/// закреплённых, затем одна общая. Пустая предпочитаемая очередь отдаёт слот
+/// другой, worker не простаивает. Чужая очередь здесь не читается.
+fn run_local_batch(inner: &Inner, index: usize, pinned_streak: &mut usize) -> bool {
     let worker = &inner.workers[index];
     let mut ran = false;
     for _ in 0..inner.batch {
-        let Some(task) = worker.pinned.pop().or_else(|| worker.shared.pop()) else {
+        let task = if *pinned_streak >= inner.pinned_per_shared {
+            if let Some(task) = worker.shared.pop() {
+                *pinned_streak = 0;
+                Some(task)
+            } else {
+                // Общей нет — слот забирает закреплённая, долг перед общей остаётся.
+                worker.pinned.pop()
+            }
+        } else if let Some(task) = worker.pinned.pop() {
+            *pinned_streak += 1;
+            Some(task)
+        } else if let Some(task) = worker.shared.pop() {
+            *pinned_streak = 0;
+            Some(task)
+        } else {
+            None
+        };
+        let Some(task) = task else {
             break;
         };
         task();
@@ -455,8 +488,73 @@ mod tests {
         let pool = Pool::with_config(Config {
             layout: Layout::LogicalCpus,
             batch: 8,
+            pinned_per_shared: 3,
         })
         .unwrap();
         assert_eq!(pool.worker_count(), topology.cpus.len());
+    }
+
+    #[test]
+    fn shared_task_runs_within_pinned_quota() {
+        let pool = Pool::with_config(Config {
+            layout: Layout::PhysicalCores,
+            batch: 8,
+            pinned_per_shared: 3,
+        })
+        .unwrap();
+
+        struct ReleaseAll(Vec<Sender<()>>);
+        impl Drop for ReleaseAll {
+            fn drop(&mut self) {
+                for tx in &self.0 {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let worker_count = pool.worker_count();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let mut releases = Vec::with_capacity(worker_count);
+        for index in 0..worker_count {
+            let (release_tx, release_rx) = mpsc::channel();
+            releases.push(release_tx);
+            let ready_tx = ready_tx.clone();
+            pool.submit(index, true, move || {
+                let _ = ready_tx.send(());
+                let _ = release_rx.recv();
+            });
+        }
+        drop(ready_tx);
+        for _ in 0..worker_count {
+            ready_rx.recv().expect("worker не дошёл до шлагбаума");
+        }
+        let guard = ReleaseAll(releases);
+
+        let pinned_before_shared = Arc::new(AtomicUsize::new(0));
+        let shared_started = Arc::new(AtomicBool::new(false));
+        for _ in 0..64 {
+            let pinned_before_shared = Arc::clone(&pinned_before_shared);
+            let shared_started = Arc::clone(&shared_started);
+            pool.submit(0, true, move || {
+                if !shared_started.load(Ordering::Acquire) {
+                    pinned_before_shared.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+        let pinned_before_shared = Arc::clone(&pinned_before_shared);
+        let shared_started = Arc::clone(&shared_started);
+        let shared = pool.submit(0, false, move || {
+            let before = pinned_before_shared.load(Ordering::Relaxed);
+            shared_started.store(true, Ordering::Release);
+            before
+        });
+
+        let _ = guard.0[0].send(());
+        let before = shared.wait();
+        assert!(
+            before <= 3,
+            "общая задача стартовала после {before} закреплённых"
+        );
+        drop(guard);
     }
 }

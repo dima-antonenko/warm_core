@@ -84,7 +84,7 @@ When you call `Pool::new()`:
 
 Each worker then runs a simple loop:
 
-1. It runs up to 32 tasks in a row from its own queues: pinned ones first, then shared ones. During this time it ignores its neighbours, so the core keeps working with the same data.
+1. It runs up to 32 tasks in a row from its own queues. While both have work, it takes three pinned tasks and then one shared task (`Config::pinned_per_shared`, default 3). An empty queue does not spend its turn. The count carries across batches, so a short batch cannot starve the shared queue. During this time the worker ignores its neighbours, so the core keeps working with the same data.
 2. If it has no tasks of its own, it tries to take one from a neighbour's shared queue, starting with the busiest. It never touches other cores' pinned tasks: those were sent to a specific core precisely for its cache.
 3. If there is no work anywhere, it goes to sleep (`park`) until a new task is pushed into its queue.
 
@@ -130,6 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _all_logical = Pool::with_config(Config {
         layout: Layout::LogicalCpus,
         batch: 32,
+        pinned_per_shared: 3,
     })?;
 
     // The topology can be read without a pool.
@@ -344,7 +345,7 @@ The crate works on Linux only: it needs `/sys/devices/system/cpu` and `sched_set
 
 Дальше рабочий поток живёт в простом цикле:
 
-1. Выполняет подряд до 32 задач из своих очередей: сначала закреплённые, потом общие. В это время он не смотрит на соседей, и ядро работает с одним и тем же набором данных.
+1. Выполняет подряд до 32 задач из своих очередей. Пока задачи есть в обеих, он берёт три закреплённые и затем одну общую (`Config::pinned_per_shared`, по умолчанию 3). Пустая очередь не сжигает свой слот. Счётчик не обнуляется на границе пачки, поэтому короткая пачка не морит общую очередь голодом. В это время он не смотрит на соседей, и ядро работает с одним и тем же набором данных.
 2. Если своих задач нет, пробует забрать задачу из общей очереди соседа, начиная с самого загруженного. Закреплённые задачи чужих ядер не трогает: их отправили на конкретное ядро как раз ради его кэша.
 3. Если работы нет нигде, засыпает (`park`) до тех пор, пока в его очередь не положат новую задачу.
 
@@ -390,6 +391,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _all_logical = Pool::with_config(Config {
         layout: Layout::LogicalCpus,
         batch: 32,
+        pinned_per_shared: 3,
     })?;
 
     // Топологию можно прочитать и без пула.
