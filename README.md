@@ -1,12 +1,260 @@
 # warm_core
 
+[English](#english) · [Русский](#русский)
+
+## English
+
+`warm_core` is a small thread pool for Linux that tries not to shuffle data between CPU cores. Each worker thread is pinned to its own physical core, and every task runs from start to finish in one place. As a result, the data a task works on settles into that core's fast caches (L1 and L2) and stays there until the task is done.
+
+The pool discovers the CPU layout on its own from `/sys/devices/system/cpu`: how many physical cores there are, which logical CPUs share a core, and how large the caches are. Threads are pinned with the `sched_setaffinity` system call. The only external dependency is `libc`.
+
+The sections below cover, in order: a bit of background on cores and caches, how the pool works, how to use it, and what the benchmark showed.
+
+### In short
+
+On an Intel i7-8750H, the same workload took:
+
+| Variant | Time |
+|---|---|
+| Plain `std::thread`, `yield_now` after every pass | 37 ms |
+| `warm_core` | 31 ms |
+
+The pool finished about **1.2× faster**: 6 ms, or roughly 16% of the time, less. Both variants produced identical checksums, so they really did the same work. Details and caveats are in [What the benchmark shows](#what-the-benchmark-shows).
+
+`cargo test` passes: 12 library tests and 1 doctest.
+
+### Background
+
+#### Cores and logical CPUs
+
+A **physical core** is a separate execution unit of the processor. The i7-8750H has six. Each core has its own small and very fast L1 and L2 caches.
+
+A **logical CPU** is what the operating system presents as a separate processor. This machine has twelve, numbered `0` to `11`. There are twelve because each physical core runs two instruction streams at once using hyper-threading (generically called SMT). Both threads of a core share its L1 and L2.
+
+The pairs on the i7-8750H look like this:
+
+| Physical core | Logical CPUs | Core caches |
+|---|---|---|
+| 0 | 0 and 6 | L1d 32 KiB, L2 256 KiB |
+| 1 | 1 and 7 | L1d 32 KiB, L2 256 KiB |
+| 2 | 2 and 8 | L1d 32 KiB, L2 256 KiB |
+| 3 | 3 and 9 | L1d 32 KiB, L2 256 KiB |
+| 4 | 4 and 10 | L1d 32 KiB, L2 256 KiB |
+| 5 | 5 and 11 | L1d 32 KiB, L2 256 KiB |
+
+The 9 MiB **L3** cache is shared by the whole processor.
+
+#### Caches
+
+A trip to main memory costs the processor hundreds of cycles; a hit in L1 costs a few. That is why the processor keeps recently used data in caches and looks there first.
+
+A handy analogy is a desk and a cabinet in the next room:
+
+- **L1** is what you are already holding. Very little room, but instant access.
+- **L2** is the edge of the desk. More room, still very fast.
+- **L3** is a drawer nearby, shared by everyone.
+- **Main memory** is the cabinet. Plenty of room, but every trip takes a while.
+
+The processor exchanges data with memory in **cache lines** of 64 bytes rather than individual bytes: even if you need a single variable, the whole 64 bytes around it are fetched.
+
+The **working set** is the data a program is touching right now. If the working set fits in L2 and nothing evicts it, the program rarely has to go to slow memory.
+
+#### What actually happens on a thread switch
+
+A common belief is that the cache gets "wiped" when a thread is taken off a core. It does not: the processor does not clear anything, and the lines stay where they are. The real problem is different.
+
+When another thread with its own data runs on the same core, that data is not in the core's L1 and L2, so the processor loads it from L3 or memory. The new lines take up space and evict the old ones. When the first thread comes back, its data has been evicted and it has to fetch it again.
+
+It is even worse when the scheduler moves a thread to **another physical core**. That core has its own L1 and L2, and everything that was "warm" on the old core has to be loaded again. Some of the data may still be in the shared L3, but L3 is noticeably slower and also gets evicted by other data.
+
+A regular program cannot stop the operating system from preempting its threads. What it can do is make sure a thread never migrates to another core and that a task does not give up the core in the middle of its work. That is exactly what `warm_core` does.
+
+### How the pool works
+
+When you call `Pool::new()`:
+
+1. The topology is read from `/sys/devices/system/cpu`: the physical core of every logical CPU, its hyper-threading siblings, and the cache parameters.
+2. By default, **one worker thread per physical core** is started, not one per logical CPU. On the i7-8750H that is 6 threads on CPUs `0–5`. The other halves of the pairs (`6–11`) are left alone: two pool threads on the same core would share L1 and L2 and evict each other's data.
+3. Each worker is pinned to a single logical CPU via `sched_setaffinity`, so the scheduler no longer moves it to other cores. The system can still preempt it temporarily for another process, and other programs can still use the idle hyper-threading sibling — the pool does not control that.
+4. Each worker has two task queues:
+   - a **shared** queue for `execute`; other workers may take tasks from it;
+   - a **pinned** queue for `execute_on`; these tasks run only on their own core.
+5. Each queue is a ring buffer of 4096 tasks based on Dmitry Vyukov's algorithm. Several threads can push and pop at the same time. The write and read positions live on separate cache lines, and each slot occupies its own line as well. Without that, every push would dirty the line the worker is reading at that moment, and cores would bounce it back and forth. This is called false sharing: the data is logically independent but physically sits in one line.
+
+Each worker then runs a simple loop:
+
+1. It runs up to 32 tasks in a row from its own queues: pinned ones first, then shared ones. During this time it ignores its neighbours, so the core keeps working with the same data.
+2. If it has no tasks of its own, it tries to take one from a neighbour's shared queue, starting with the busiest. It never touches other cores' pinned tasks: those were sent to a specific core precisely for its cache.
+3. If there is no work anywhere, it goes to sleep (`park`) until a new task is pushed into its queue.
+
+`Layout::LogicalCpus` starts a worker on every logical CPU, including the second halves of hyper-threading pairs. It can be useful when tasks barely depend on the cache. If a task's working set is comparable to L2, the default layout is usually the better choice.
+
+### Life of a task
+
+`execute` puts the task into the shared queue of the core that currently has the fewest tasks. On a tie, cores are picked round-robin so that work does not pile up on core zero. If another core becomes idle first, it may take the task.
+
+`execute_on(core, ...)` puts the task into the pinned queue of the given physical core, and that is where it runs. In `LogicalCpus` mode, where a core has two workers, the task goes to the less loaded of the two.
+
+Both calls return a `JobHandle`, so the calling thread can keep working. The result is retrieved with `wait()`, which blocks until the task finishes. If the core's queue is full (4096 tasks), the call does not return an error: it waits until there is room.
+
+If a task panics, the panic is propagated to `wait()`. The worker itself keeps running and picks up the next task.
+
+When the pool is dropped, it tells the workers to stop, wakes them up, and waits until they finish every task already in their queues.
+
+### Usage
+
+```rust
+use warm_core::{Config, Layout, Pool, Topology};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Default pool: one pinned worker per physical core,
+    // up to 32 tasks in a row from its own queue.
+    let pool = Pool::new()?;
+
+    println!("workers: {}", pool.worker_count());
+    println!("pinned to CPUs: {:?}", pool.pinned_cpus());
+
+    // The task goes to the least loaded core.
+    // wait() blocks until it is done and returns the result.
+    let sum = pool.execute(|| 2 + 2).wait();
+    assert_eq!(sum, 4);
+
+    // The task runs on exactly the chosen core.
+    // Handy when several tasks in a row work with the same data.
+    let core = pool.cores()[0];
+    let pinned = pool.execute_on(core, || 10)?.wait();
+    assert_eq!(pinned, 10);
+
+    // A worker on every logical CPU, hyper-threading siblings included.
+    let _all_logical = Pool::with_config(Config {
+        layout: Layout::LogicalCpus,
+        batch: 32,
+    })?;
+
+    // The topology can be read without a pool.
+    let topology = Topology::detect()?;
+    println!("logical CPUs: {}", topology.cpus.len());
+    println!("L2 per core: {:?} bytes", topology.l2_size_bytes());
+
+    Ok(())
+}
+```
+
+If the pool has no such core, `execute_on` returns `PoolError::UnknownCore`.
+
+A closure passed to the pool must be `Send + 'static`: it runs on another thread, so it cannot borrow local variables of the calling code. Move the data it needs inside with `move`.
+
+### What the benchmark shows
+
+The benchmark lives in `examples/compare.rs`. Built with `--release` on an Intel Core i7-8750H (6 cores, 12 threads, 256 KiB of L2 per core).
+
+Both variants do identical work:
+
+- there are twice as many tasks as logical CPUs — 24 on this machine;
+- each task has its own buffer the size of one core's L2 — 256 KiB here;
+- each task makes 40 passes over its buffer, incrementing every byte by 1 and accumulating a checksum along the way;
+- at the end the checksums of both variants are compared: this keeps the compiler from optimizing the work away and confirms the results match.
+
+The only difference is how the work is laid out on the processor.
+
+**The baseline** spawns 24 separate `std::thread`s — four times as many as there are physical cores. After each pass a thread calls `yield_now()` and gives up the CPU. Another thread with its own L2-sized buffer takes its place and evicts the previous thread's data. When the first thread comes back, its next pass starts with a "cold" cache. On top of that, the threads are not pinned, so the scheduler is free to move them between cores.
+
+**`warm_core`** runs the same 24 tasks on 6 pre-spawned threads, one per physical core. Nobody gives up the CPU between passes, so a task's buffer stays in its core's cache for all 40 passes. The next task on that core starts only after the previous one has finished.
+
+Results:
+
+| | `std::thread` + `yield_now` | `warm_core` |
+|---|---:|---:|
+| Time | 37 ms | 31 ms |
+| Speedup | 1.0 | **1.2** |
+
+How to read these numbers:
+
+- The pool finished 6 ms earlier: `37 − 31 = 6`.
+- Speedup: `37 / 31 ≈ 1.19`, rounded to 1.2.
+- If you ran this batch continuously, the baseline would complete about 27 batches per second (`1000 / 37`) and the pool about 32 (`1000 / 31`), i.e. roughly 19% more.
+
+Important caveats:
+
+- The difference is not only about caches. The baseline's measured time includes spawning 24 threads, whereas the pool is created before the timer starts. The baseline also adds its own context switches via `yield_now`. This is a comparison against a deliberately poor way of parallelizing, not against a well-tuned pool such as `rayon`.
+- This is a single short run on a single machine. On a different processor, with different cache sizes, or under background load the numbers will differ, so 1.2 is not a guaranteed result.
+- The pool helps most when a task re-reads the same data many times and, without the pool, threads would often switch and migrate between cores. If a task streams through memory once and never comes back to it, keeping the cache warm buys almost nothing.
+
+To reproduce:
+
+```bash
+cargo run --release --example compare
+```
+
+The example prints the number of logical CPUs and pool workers, the buffer size, the list of CPUs the workers are pinned to, and the time of both variants.
+
+Hardware counters via `perf` help explain where the difference comes from. Build the example first and run the binary directly, otherwise `cargo` itself ends up in the statistics:
+
+```bash
+cargo build --release --example compare
+perf stat -e L1-dcache-load-misses,LLC-load-misses,context-switches,cpu-migrations \
+  ./target/release/examples/compare
+```
+
+The counters cover the whole process, i.e. both variants together. To compare them separately, temporarily comment one of them out in `examples/compare.rs`. Expect the baseline to show noticeably more `context-switches` and `cpu-migrations`: its threads give up the CPU themselves and the scheduler puts them wherever it can. Pool workers are each pinned to a single CPU and do not migrate between cores.
+
+The same scenario is also available as a criterion benchmark:
+
+```bash
+cargo bench
+```
+
+It uses 8 passes instead of 40, and the number of tasks is derived from `available_parallelism()`. Criterion repeats the runs and estimates the spread. The example in `examples/` is easier to read; the benchmark gives more reliable numbers.
+
+### Tests
+
+`cargo test` runs 12 library tests and the doc example in `src/lib.rs`.
+
+Queue:
+
+- values are pushed and popped around the ring, and a full queue rejects new ones;
+- the write and read positions sit on different cache lines;
+- four threads push and four pop 8000 numbers, with none lost or duplicated.
+
+Pool:
+
+- 200 tasks return correct results;
+- each worker may run on exactly one CPU — the one it is pinned to;
+- `execute_on` with a nonexistent core returns an error;
+- a panic in a task does not stop the worker;
+- in `LogicalCpus` mode a worker is started on every logical CPU.
+
+Topology and pinning:
+
+- CPU lists such as `0,6` and `0-3,8` are parsed;
+- cache sizes such as `32K`, `256K`, `9M` are parsed;
+- on the current machine the cache line size is a power of two, and each physical core gets at most one worker;
+- `sched_setaffinity` really narrows the thread's mask down to one CPU.
+
+### Project layout
+
+| File | Contents |
+|---|---|
+| `src/topology.rs` | Reads cores, hyper-threading pairs and caches from `/sys` |
+| `src/affinity.rs` | Pins a thread to a single CPU |
+| `src/queue.rs` | Task queue with positions on separate cache lines |
+| `src/pool.rs` | The pool itself: two queues per core, batched execution, `execute` and `execute_on` |
+| `examples/compare.rs` | Comparison against plain threads |
+| `benches/locality.rs` | The same comparison using criterion |
+
+### Limitations
+
+The crate works on Linux only: it needs `/sys/devices/system/cpu` and `sched_setaffinity`. The topology is read once when the pool is created. If the process runs with a restricted CPU set (for example via `taskset` or cgroups) and the pool tries to pin a worker to an unavailable CPU, `Pool::new()` returns an error.
+
+## Русский
+
 `warm_core` — небольшой пул потоков для Linux, который старается не гонять данные между ядрами процессора. Каждый рабочий поток закреплён за своим физическим ядром, и задача от начала до конца выполняется на одном месте. Поэтому данные, с которыми она работает, успевают осесть в быстрых кэшах этого ядра (L1 и L2) и остаются там, пока задача не закончится.
 
 Пул сам узнаёт устройство процессора из `/sys/devices/system/cpu`: сколько физических ядер, какие логические CPU делят одно ядро, какого размера кэши. Потоки привязываются к ядрам системным вызовом `sched_setaffinity`. Из внешних зависимостей только `libc`.
 
 Ниже по порядку: немного теории про ядра и кэши, как устроен пул, как им пользоваться и что показал замер.
 
-## Коротко
+### Коротко
 
 На Intel i7-8750H одну и ту же работу удалось выполнить так:
 
@@ -19,9 +267,9 @@
 
 `cargo test` проходит: 12 тестов библиотеки и 1 doctest.
 
-## Немного теории
+### Немного теории
 
-### Ядра и логические CPU
+#### Ядра и логические CPU
 
 **Физическое ядро** — отдельный вычислительный блок процессора. У i7-8750H их шесть. У каждого ядра есть собственные маленькие и очень быстрые кэши L1 и L2.
 
@@ -40,7 +288,7 @@
 
 Кэш **L3** на 9 МБ один на весь процессор, им пользуются все ядра.
 
-### Кэши
+#### Кэши
 
 Обращение к оперативной памяти стоит процессору сотни тактов, а к L1 — единицы. Поэтому процессор держит недавно использованные данные в кэшах и сначала ищет их там.
 
@@ -55,7 +303,7 @@
 
 **Рабочий набор** (working set) — данные, к которым программа обращается прямо сейчас. Если рабочий набор помещается в L2 и никто его оттуда не вытесняет, программа почти не ходит в медленную память.
 
-### Что на самом деле происходит при переключении потоков
+#### Что на самом деле происходит при переключении потоков
 
 Есть популярное представление, что при снятии потока с ядра кэш «стирается». Это не так: процессор ничего не обнуляет, линии остаются на месте. Проблема в другом.
 
@@ -65,7 +313,7 @@
 
 Обычная программа не может запретить операционной системе вытеснять свои потоки. Зато можно сделать так, чтобы поток никогда не переезжал на другое ядро и чтобы задача не отдавала ядро посреди работы. Именно этим и занимается `warm_core`.
 
-## Как устроен пул
+### Как устроен пул
 
 При вызове `Pool::new()` происходит следующее:
 
@@ -85,7 +333,7 @@
 
 Режим `Layout::LogicalCpus` запускает рабочий поток на каждом логическом CPU, включая вторые половины пар hyper-threading. Он может пригодиться, когда задачи почти не зависят от кэша. Если рабочий набор задачи сравним с L2, режим по умолчанию обычно выгоднее.
 
-## Путь одной задачи
+### Путь одной задачи
 
 `execute` кладёт задачу в общую очередь ядра, у которого сейчас меньше всего задач. При равенстве ядра выбираются по кругу, чтобы всё не скапливалось на нулевом. Если какое-то ядро освободится раньше, оно может забрать эту задачу себе.
 
@@ -97,7 +345,7 @@
 
 Когда пул уничтожается, он сообщает потокам об остановке, будит их и ждёт, пока они выполнят все задачи, которые уже стоят в очередях.
 
-## Как пользоваться
+### Как пользоваться
 
 ```rust
 use warm_core::{Config, Layout, Pool, Topology};
@@ -140,7 +388,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Замыкание, которое передаётся в пул, должно быть `Send + 'static`: его выполняет другой поток, поэтому оно не может ссылаться на локальные переменные вызывающего кода. Нужные данные передаются внутрь через `move`.
 
-## Что показал замер
+### Что показал замер
 
 Замер лежит в `examples/compare.rs`. Сборка `--release`, процессор Intel Core i7-8750H (6 ядер, 12 потоков, L2 256 КБ на ядро).
 
@@ -202,7 +450,7 @@ cargo bench
 
 Там 8 проходов вместо 40, а число задач считается от `available_parallelism()`. Criterion сам повторяет прогоны и оценивает разброс. Пример из `examples/` проще читать, а бенчмарк даёт более надёжные цифры.
 
-## Тесты
+### Тесты
 
 `cargo test` запускает 12 тестов библиотеки и пример из документации в `src/lib.rs`.
 
@@ -227,7 +475,7 @@ cargo bench
 - на текущей машине размер кэш-линии — степень двойки, и на каждое физическое ядро приходится не больше одного рабочего потока;
 - `sched_setaffinity` действительно сужает маску потока до одного CPU.
 
-## Структура проекта
+### Структура проекта
 
 | Файл | Что внутри |
 |---|---|
@@ -238,6 +486,6 @@ cargo bench
 | `examples/compare.rs` | Сравнение с обычными потоками |
 | `benches/locality.rs` | То же сравнение на criterion |
 
-## Ограничения
+### Ограничения
 
 Крейт работает только в Linux: ему нужны `/sys/devices/system/cpu` и `sched_setaffinity`. Топология читается один раз при создании пула. Если процесс запущен с ограниченным набором CPU (например, через `taskset` или cgroups), а пул попытается закрепить поток за недоступным CPU, `Pool::new()` вернёт ошибку.
