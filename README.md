@@ -227,7 +227,8 @@ Queue:
 
 - values are pushed and popped around the ring, and a full queue rejects new ones;
 - the write and read positions sit on different cache lines;
-- four threads push and four pop 8000 numbers, with none lost or duplicated.
+- four threads push and four pop 8000 numbers, with none lost or duplicated;
+- a Loom model checks that `len` does not wrap while one value moves from `push` to `pop`. It stays outside `cargo test`; see [QUEUE.md](QUEUE.md).
 
 Pool:
 
@@ -255,6 +256,7 @@ Topology and pinning:
 | `examples/compare.rs` | Rayon with and without affinity, plus `warm_core` |
 | `benches/locality.rs` | The same comparison using criterion |
 | `BENCHMARK.md` | Why the comparison changed, and what the run showed |
+| `QUEUE.md` | Why `len` grows before a slot is published, and how Loom checks it |
 
 ### Limitations
 
@@ -486,7 +488,8 @@ cargo bench
 
 - значения кладутся и забираются по кольцу, а заполненная очередь отказывается принимать новые;
 - позиции записи и чтения лежат на разных кэш-линиях;
-- четыре потока кладут и четыре забирают 8000 чисел, при этом ни одно не теряется и не дублируется.
+- четыре потока кладут и четыре забирают 8000 чисел, при этом ни одно не теряется и не дублируется;
+- модель Loom проверяет, что `len` не оборачивается, пока одно значение переходит из `push` в `pop`. В обычный `cargo test` она не входит; см. [QUEUE.md](QUEUE.md).
 
 Пул:
 
@@ -514,6 +517,7 @@ cargo bench
 | `examples/compare.rs` | Rayon с affinity и без неё, плюс `warm_core` |
 | `benches/locality.rs` | То же сравнение на criterion |
 | `BENCHMARK.md` | Почему сравнение поменялось и что показал прогон |
+| `QUEUE.md` | Почему `len` растёт до публикации слота и как это проверяет Loom |
 
 ### Ограничения
 
