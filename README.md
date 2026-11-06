@@ -98,7 +98,7 @@ The quota, and why the count has to survive a batch boundary, is written up in [
 
 `execute_on(core, ...)` puts the task into the pinned queue of the given physical core, and that is where it runs. In `LogicalCpus` mode, where a core has two workers, both pinned queues are tried, least loaded first.
 
-Both calls return a `JobHandle`, so the calling thread can keep working. The result is retrieved with `wait()`, which blocks until the task finishes. Each queue holds 4096 tasks. When every queue the call may use is full, `execute` and `execute_on` sleep until a slot appears, but no longer than `Config::submit_timeout` (one second by default), and then return `PoolError::QueueFull`. `try_execute` and `try_execute_on` do not sleep: a full queue is an immediate `QueueFull`. The closure has already been moved into the call, so on `QueueFull` it is dropped and the task never starts.
+Both calls return a `JobHandle`, so the calling thread can keep working. The result is retrieved with `wait()`, which blocks until the task finishes. Each queue holds 4096 tasks. When every queue the call may use is full, `execute` and `execute_on` sleep until a slot appears, but no longer than `Config::submit_timeout` (one second by default), and then return `PoolError::QueueFull`. `try_execute` and `try_execute_on` do not sleep: a full queue is an immediate `QueueFull`. The closure has already been moved into the call, so on `QueueFull` it is dropped and the task never starts. How the wait is bounded, and why a full queue sleeps on a futex, is written up in [BACKPRESSURE.md](BACKPRESSURE.md).
 
 If a task panics, the panic is propagated to `wait()`. The worker itself keeps running and picks up the next task.
 
@@ -271,6 +271,7 @@ Topology and pinning:
 | `BENCHMARK.md` | Why the comparison changed, and what the run showed |
 | `QUEUE.md` | Why `len` grows before a slot is published, and how Loom checks it |
 | `FAIRNESS.md` | Why a steady pinned load leaves a slot for the shared queue |
+| `BACKPRESSURE.md` | Why a full queue sleeps for a bounded time instead of spinning |
 
 ### Limitations
 
@@ -372,7 +373,7 @@ The crate works on Linux only: it needs `/sys/devices/system/cpu` and `sched_set
 
 `execute_on(core, ...)` кладёт задачу в закреплённую очередь указанного физического ядра. Там она и будет выполнена. В режиме `LogicalCpus`, где на ядре два рабочих потока, пробуются обе закреплённые очереди, сначала у менее загруженного.
 
-Оба вызова возвращают `JobHandle`, и вызывающий поток может продолжать работу. Результат забирается через `wait()`, который ждёт завершения задачи. В каждой очереди 4096 задач. Когда все очереди, куда вызов может положить задачу, заполнены, `execute` и `execute_on` спят, пока не появится слот, но не дольше `Config::submit_timeout` (по умолчанию одна секунда), а затем возвращают `PoolError::QueueFull`. `try_execute` и `try_execute_on` не спят: полная очередь — это сразу `QueueFull`. Замыкание к этому моменту уже передано вызову, поэтому при `QueueFull` оно уничтожается и задача не запускается.
+Оба вызова возвращают `JobHandle`, и вызывающий поток может продолжать работу. Результат забирается через `wait()`, который ждёт завершения задачи. В каждой очереди 4096 задач. Когда все очереди, куда вызов может положить задачу, заполнены, `execute` и `execute_on` спят, пока не появится слот, но не дольше `Config::submit_timeout` (по умолчанию одна секунда), а затем возвращают `PoolError::QueueFull`. `try_execute` и `try_execute_on` не спят: полная очередь — это сразу `QueueFull`. Замыкание к этому моменту уже передано вызову, поэтому при `QueueFull` оно уничтожается и задача не запускается. Как ограничен срок ожидания и почему полная очередь засыпает на futex, разобрано в [BACKPRESSURE.md](BACKPRESSURE.md).
 
 Если задача запаникует, паника будет передана в `wait()`. Сам рабочий поток при этом продолжит работу и возьмёт следующую задачу.
 
@@ -546,6 +547,7 @@ cargo bench
 | `BENCHMARK.md` | Почему сравнение поменялось и что показал прогон |
 | `QUEUE.md` | Почему `len` растёт до публикации слота и как это проверяет Loom |
 | `FAIRNESS.md` | Почему постоянный поток закреплённых задач оставляет слот общей очереди |
+| `BACKPRESSURE.md` | Почему полная очередь спит ограниченное время, а не крутится в `yield_now` |
 
 ### Ограничения
 
