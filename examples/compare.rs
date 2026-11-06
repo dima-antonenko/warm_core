@@ -44,7 +44,7 @@ fn run_rayon(pool: &rayon::ThreadPool, jobs: usize, bytes: usize) -> u64 {
 
 fn run_warm(pool: &Pool, jobs: usize, bytes: usize) -> u64 {
     let handles: Vec<_> = (0..jobs)
-        .map(|id| pool.execute(move || work(id, bytes)))
+        .map(|id| pool.execute(move || work(id, bytes)).expect("слот"))
         .collect();
     handles
         .into_iter()

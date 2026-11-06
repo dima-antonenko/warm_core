@@ -9,11 +9,12 @@
 //!
 //! ```
 //! let pool = warm_core::Pool::new().expect("пул");
-//! let handle = pool.execute(|| 2 + 2);
+//! let handle = pool.execute(|| 2 + 2).unwrap();
 //! assert_eq!(handle.wait(), 4);
 //! ```
 
 mod affinity;
+mod gate;
 mod pool;
 mod queue;
 mod topology;

@@ -22,7 +22,7 @@ On an Intel i7-8750H, the same workload took:
 
 The affinity mask by itself did not shorten the work: pinned Rayon came out at **0.95×**. `warm_core` finished about **1.4× faster** than unpinned Rayon, 11 ms less, and it was also faster than the pinned Rayon pool. All three variants produced identical checksums, so they really did the same work. Details and caveats are in [What the benchmark shows](#what-the-benchmark-shows).
 
-`cargo test` passes: 12 library tests and 1 doctest.
+`cargo test` passes: 20 library tests and 1 doctest.
 
 ### Background
 
@@ -94,11 +94,11 @@ The quota, and why the count has to survive a batch boundary, is written up in [
 
 ### Life of a task
 
-`execute` puts the task into the shared queue of the core that currently has the fewest tasks. On a tie, cores are picked round-robin so that work does not pile up on core zero. If another core becomes idle first, it may take the task.
+`execute` puts the task into the shared queue of the core that currently has the fewest tasks. On a tie, cores are picked round-robin so that work does not pile up on core zero. If that queue is full, the other cores are tried too. If another core becomes idle first, it may take the task.
 
-`execute_on(core, ...)` puts the task into the pinned queue of the given physical core, and that is where it runs. In `LogicalCpus` mode, where a core has two workers, the task goes to the less loaded of the two.
+`execute_on(core, ...)` puts the task into the pinned queue of the given physical core, and that is where it runs. In `LogicalCpus` mode, where a core has two workers, both pinned queues are tried, least loaded first.
 
-Both calls return a `JobHandle`, so the calling thread can keep working. The result is retrieved with `wait()`, which blocks until the task finishes. If the core's queue is full (4096 tasks), the call does not return an error: it waits until there is room.
+Both calls return a `JobHandle`, so the calling thread can keep working. The result is retrieved with `wait()`, which blocks until the task finishes. Each queue holds 4096 tasks. When every queue the call may use is full, `execute` and `execute_on` sleep until a slot appears, but no longer than `Config::submit_timeout` (one second by default), and then return `PoolError::QueueFull`. `try_execute` and `try_execute_on` do not sleep: a full queue is an immediate `QueueFull`. The closure has already been moved into the call, so on `QueueFull` it is dropped and the task never starts.
 
 If a task panics, the panic is propagated to `wait()`. The worker itself keeps running and picks up the next task.
 
@@ -119,7 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The task goes to the least loaded core.
     // wait() blocks until it is done and returns the result.
-    let sum = pool.execute(|| 2 + 2).wait();
+    let sum = pool.execute(|| 2 + 2)?.wait();
     assert_eq!(sum, 4);
 
     // The task runs on exactly the chosen core.
@@ -133,6 +133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         layout: Layout::LogicalCpus,
         batch: 32,
         pinned_per_shared: 3,
+        submit_timeout: std::time::Duration::from_secs(1),
     })?;
 
     // The topology can be read without a pool.
@@ -147,7 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-If the pool has no such core, `execute_on` returns `PoolError::UnknownCore`.
+If the pool has no such core, `execute_on` and `try_execute_on` return `PoolError::UnknownCore`. A full pinned queue of a core that does exist is `PoolError::QueueFull`.
 
 `pin_to` is public, so other threads — the Rayon workers in `examples/compare.rs`, for instance — can be pinned with the same system call the pool uses.
 
@@ -224,7 +225,7 @@ It uses 8 passes instead of 40, and the number of tasks is derived from `availab
 
 ### Tests
 
-`cargo test` runs 13 library tests and the doc example in `src/lib.rs`.
+`cargo test` runs 20 library tests and the doc example in `src/lib.rs`.
 
 Queue:
 
@@ -240,7 +241,14 @@ Pool:
 - `execute_on` with a nonexistent core returns an error;
 - a panic in a task does not stop the worker;
 - in `LogicalCpus` mode a worker is started on every logical CPU;
-- a shared task still starts within `pinned_per_shared` pinned tasks when that worker's pinned queue is kept full. See [FAIRNESS.md](FAIRNESS.md).
+- a shared task still starts within `pinned_per_shared` pinned tasks when that worker's pinned queue is kept full. See [FAIRNESS.md](FAIRNESS.md);
+- `try_execute` on a full shared queue returns `QueueFull` without waiting out `submit_timeout`;
+- `execute` returns `QueueFull` once `submit_timeout` expires;
+- `execute` finishes if a worker frees a slot while the caller is asleep;
+- `try_execute_on` returns `UnknownCore` for a missing core and `QueueFull` when that core's pinned queue is full;
+- the waiter count and the futex word sit on different cache lines;
+- a wait ends when its timeout expires;
+- freeing a slot wakes a thread that is waiting for one.
 
 Topology and pinning:
 
@@ -256,7 +264,8 @@ Topology and pinning:
 | `src/topology.rs` | Reads cores, hyper-threading pairs and caches from `/sys` |
 | `src/affinity.rs` | Pins a thread to a single CPU (`pin_to`) |
 | `src/queue.rs` | Task queue with positions on separate cache lines |
-| `src/pool.rs` | The pool itself: two queues per core, batched execution, `execute` and `execute_on` |
+| `src/gate.rs` | Bounded sleep until a queue slot is free, without a lock on every pop |
+| `src/pool.rs` | The pool itself: two queues per core, batched execution, `execute`, `try_execute`, and `execute_on` |
 | `examples/compare.rs` | Rayon with and without affinity, plus `warm_core` |
 | `benches/locality.rs` | The same comparison using criterion |
 | `BENCHMARK.md` | Why the comparison changed, and what the run showed |
@@ -287,7 +296,7 @@ The crate works on Linux only: it needs `/sys/devices/system/cpu` and `sched_set
 
 Сама маска affinity работу не сократила: привязанный Rayon показал **0.95×**. `warm_core` справился примерно в **1.4 раза быстрее** непривязанного Rayon, на 11 мс меньше, и обогнал привязанный Rayon тоже. Все три варианта посчитали одинаковые контрольные суммы, так что работа действительно одна и та же. Подробности замера и оговорки к нему — в разделе [«Что показал замер»](#что-показал-замер).
 
-`cargo test` проходит: 12 тестов библиотеки и 1 doctest.
+`cargo test` проходит: 20 тестов библиотеки и 1 doctest.
 
 ### Немного теории
 
@@ -359,11 +368,11 @@ The crate works on Linux only: it needs `/sys/devices/system/cpu` and `sched_set
 
 ### Путь одной задачи
 
-`execute` кладёт задачу в общую очередь ядра, у которого сейчас меньше всего задач. При равенстве ядра выбираются по кругу, чтобы всё не скапливалось на нулевом. Если какое-то ядро освободится раньше, оно может забрать эту задачу себе.
+`execute` кладёт задачу в общую очередь ядра, у которого сейчас меньше всего задач. При равенстве ядра выбираются по кругу, чтобы всё не скапливалось на нулевом. Если эта очередь полна, пробуются и остальные ядра. Если какое-то ядро освободится раньше, оно может забрать эту задачу себе.
 
-`execute_on(core, ...)` кладёт задачу в закреплённую очередь указанного физического ядра. Там она и будет выполнена. В режиме `LogicalCpus`, где на ядре два рабочих потока, задача достанется менее загруженному из них.
+`execute_on(core, ...)` кладёт задачу в закреплённую очередь указанного физического ядра. Там она и будет выполнена. В режиме `LogicalCpus`, где на ядре два рабочих потока, пробуются обе закреплённые очереди, сначала у менее загруженного.
 
-Оба вызова возвращают `JobHandle`, и вызывающий поток может продолжать работу. Результат забирается через `wait()`, который ждёт завершения задачи. Если очередь ядра заполнена (4096 задач), вызов не возвращает ошибку: он ждёт, пока в очереди освободится место.
+Оба вызова возвращают `JobHandle`, и вызывающий поток может продолжать работу. Результат забирается через `wait()`, который ждёт завершения задачи. В каждой очереди 4096 задач. Когда все очереди, куда вызов может положить задачу, заполнены, `execute` и `execute_on` спят, пока не появится слот, но не дольше `Config::submit_timeout` (по умолчанию одна секунда), а затем возвращают `PoolError::QueueFull`. `try_execute` и `try_execute_on` не спят: полная очередь — это сразу `QueueFull`. Замыкание к этому моменту уже передано вызову, поэтому при `QueueFull` оно уничтожается и задача не запускается.
 
 Если задача запаникует, паника будет передана в `wait()`. Сам рабочий поток при этом продолжит работу и возьмёт следующую задачу.
 
@@ -384,7 +393,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Задача уходит на наименее загруженное ядро.
     // wait() ждёт, пока её выполнят, и возвращает результат.
-    let sum = pool.execute(|| 2 + 2).wait();
+    let sum = pool.execute(|| 2 + 2)?.wait();
     assert_eq!(sum, 4);
 
     // Задача выполнится именно на выбранном ядре.
@@ -398,6 +407,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         layout: Layout::LogicalCpus,
         batch: 32,
         pinned_per_shared: 3,
+        submit_timeout: std::time::Duration::from_secs(1),
     })?;
 
     // Топологию можно прочитать и без пула.
@@ -413,7 +423,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Если в пуле нет указанного ядра, `execute_on` вернёт `PoolError::UnknownCore`.
+Если в пуле нет указанного ядра, `execute_on` и `try_execute_on` вернут `PoolError::UnknownCore`. Полная закреплённая очередь существующего ядра — это `PoolError::QueueFull`.
 
 `pin_to` публичный: тем же системным вызовом, что и пул, можно привязать и чужие потоки. Так пример `examples/compare.rs` закрепляет рабочие потоки Rayon.
 
@@ -490,7 +500,7 @@ cargo bench
 
 ### Тесты
 
-`cargo test` запускает 13 тестов библиотеки и пример из документации в `src/lib.rs`.
+`cargo test` запускает 20 тестов библиотеки и пример из документации в `src/lib.rs`.
 
 Очередь:
 
@@ -506,7 +516,14 @@ cargo bench
 - `execute_on` с несуществующим ядром возвращает ошибку;
 - паника в задаче не останавливает рабочий поток;
 - в режиме `LogicalCpus` рабочий поток запускается на каждом логическом CPU;
-- общая задача всё равно стартует в пределах `pinned_per_shared` закреплённых, когда закреплённая очередь этого потока не пустеет. См. [FAIRNESS.md](FAIRNESS.md).
+- общая задача всё равно стартует в пределах `pinned_per_shared` закреплённых, когда закреплённая очередь этого потока не пустеет. См. [FAIRNESS.md](FAIRNESS.md);
+- `try_execute` на полной общей очереди возвращает `QueueFull` и не ждёт `submit_timeout`;
+- `execute` возвращает `QueueFull`, когда выходит `submit_timeout`;
+- `execute` завершается, если рабочий поток освобождает слот, пока вызывающий спит;
+- `try_execute_on` возвращает `UnknownCore` для несуществующего ядра и `QueueFull`, когда закреплённая очередь этого ядра полна;
+- счётчик ожидающих и слово futex лежат на разных кэш-линиях;
+- ожидание заканчивается, когда выходит его срок;
+- освобождение слота будит поток, который этого слота ждёт.
 
 Топология и привязка:
 
@@ -522,7 +539,8 @@ cargo bench
 | `src/topology.rs` | Чтение ядер, пар hyper-threading и кэшей из `/sys` |
 | `src/affinity.rs` | Привязка потока к одному CPU (`pin_to`) |
 | `src/queue.rs` | Очередь задач с позициями на разных кэш-линиях |
-| `src/pool.rs` | Сам пул: две очереди на ядро, выполнение пачками, `execute` и `execute_on` |
+| `src/gate.rs` | Сон до свободного слота очереди, без замка на каждом pop |
+| `src/pool.rs` | Сам пул: две очереди на ядро, выполнение пачками, `execute`, `try_execute` и `execute_on` |
 | `examples/compare.rs` | Rayon с affinity и без неё, плюс `warm_core` |
 | `benches/locality.rs` | То же сравнение на criterion |
 | `BENCHMARK.md` | Почему сравнение поменялось и что показал прогон |

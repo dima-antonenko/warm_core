@@ -52,7 +52,7 @@ fn run_rayon(pool: &ThreadPool) -> u64 {
 
 fn run_warm(pool: &Pool) -> u64 {
     let handles: Vec<_> = (0..jobs())
-        .map(|id| pool.execute(move || work(id)))
+        .map(|id| pool.execute(move || work(id)).expect("слот"))
         .collect();
     handles
         .into_iter()
