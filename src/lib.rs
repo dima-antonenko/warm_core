@@ -18,5 +18,6 @@ mod pool;
 mod queue;
 mod topology;
 
+pub use affinity::pin_to;
 pub use pool::{Config, JobHandle, Layout, Pool, PoolError};
 pub use topology::{CacheInfo, CoreId, Cpu, Topology};

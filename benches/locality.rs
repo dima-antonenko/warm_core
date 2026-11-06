@@ -5,8 +5,11 @@ use std::thread;
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use rayon::ThreadPool;
+use rayon::ThreadPoolBuilder;
+use rayon::prelude::*;
 
-use warm_core::Pool;
+use warm_core::{Pool, pin_to};
 
 const PASSES: usize = 8;
 const BUF: usize = 256 * 1024;
@@ -21,14 +24,11 @@ fn scan(buf: &mut [u8]) -> u64 {
     black_box(acc)
 }
 
-fn work(id: usize, yield_between_passes: bool) -> u64 {
+fn work(id: usize) -> u64 {
     let mut buf = vec![id as u8; BUF];
     let mut acc = 0u64;
     for _ in 0..PASSES {
         acc ^= scan(&mut buf);
-        if yield_between_passes {
-            thread::yield_now();
-        }
     }
     acc
 }
@@ -40,19 +40,19 @@ fn jobs() -> usize {
         .saturating_mul(2)
 }
 
-fn baseline() -> u64 {
-    let handles: Vec<_> = (0..jobs())
-        .map(|id| thread::spawn(move || work(id, true)))
-        .collect();
-    handles
-        .into_iter()
-        .map(|handle| handle.join().expect("поток базы"))
-        .fold(0, |acc, value| acc ^ value)
+fn run_rayon(pool: &ThreadPool) -> u64 {
+    let jobs = jobs();
+    pool.install(|| {
+        (0..jobs)
+            .into_par_iter()
+            .map(work)
+            .reduce(|| 0, |a, b| a ^ b)
+    })
 }
 
-fn warm(pool: &Pool) -> u64 {
+fn run_warm(pool: &Pool) -> u64 {
     let handles: Vec<_> = (0..jobs())
-        .map(|id| pool.execute(move || work(id, false)))
+        .map(|id| pool.execute(move || work(id)))
         .collect();
     handles
         .into_iter()
@@ -61,13 +61,30 @@ fn warm(pool: &Pool) -> u64 {
 }
 
 fn locality(c: &mut Criterion) {
-    let pool = Pool::new().expect("пул");
+    let warm = Pool::new().expect("пул");
+    let workers = warm.worker_count();
+    let cpus = warm.pinned_cpus();
+    let rayon_free = ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .build()
+        .expect("rayon");
+    let rayon_pinned = ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .start_handler(move |index| {
+            pin_to(cpus[index]).expect("привязка rayon");
+        })
+        .build()
+        .expect("rayon с affinity");
+
     let mut group = c.benchmark_group("l2_working_set");
     group.sample_size(10);
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(2));
-    group.bench_function("std_thread_yield", |b| b.iter(|| black_box(baseline())));
-    group.bench_function("warm_core", |b| b.iter(|| black_box(warm(&pool))));
+    group.bench_function("rayon", |b| b.iter(|| black_box(run_rayon(&rayon_free))));
+    group.bench_function("rayon_affinity", |b| {
+        b.iter(|| black_box(run_rayon(&rayon_pinned)))
+    });
+    group.bench_function("warm_core", |b| b.iter(|| black_box(run_warm(&warm))));
     group.finish();
 }
 

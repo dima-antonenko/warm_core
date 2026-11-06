@@ -16,10 +16,11 @@ On an Intel i7-8750H, the same workload took:
 
 | Variant | Time |
 |---|---|
-| Plain `std::thread`, `yield_now` after every pass | 37 ms |
-| `warm_core` | 31 ms |
+| Rayon, 6 workers, no affinity | 37.7 ms |
+| Rayon, 6 workers, pinned like the pool | 39.5 ms |
+| `warm_core` | 26.6 ms |
 
-The pool finished about **1.2× faster**: 6 ms, or roughly 16% of the time, less. Both variants produced identical checksums, so they really did the same work. Details and caveats are in [What the benchmark shows](#what-the-benchmark-shows).
+The affinity mask by itself did not shorten the work: pinned Rayon came out at **0.95×**. `warm_core` finished about **1.4× faster** than unpinned Rayon, 11 ms less, and it was also faster than the pinned Rayon pool. All three variants produced identical checksums, so they really did the same work. Details and caveats are in [What the benchmark shows](#what-the-benchmark-shows).
 
 `cargo test` passes: 12 library tests and 1 doctest.
 
@@ -67,7 +68,7 @@ When another thread with its own data runs on the same core, that data is not in
 
 It is even worse when the scheduler moves a thread to **another physical core**. That core has its own L1 and L2, and everything that was "warm" on the old core has to be loaded again. Some of the data may still be in the shared L3, but L3 is noticeably slower and also gets evicted by other data.
 
-A regular program cannot stop the operating system from preempting its threads. What it can do is make sure a thread never migrates to another core and that a task does not give up the core in the middle of its work. That is exactly what `warm_core` does.
+A regular program cannot stop the operating system from preempting its threads. What it can do is pin a thread to one core and keep a task from giving that core up in the middle of its work. `warm_core` does both. The benchmark further down runs the same Rayon pool with and without a pin, so the mask and the pool's own queues are visible separately.
 
 ### How the pool works
 
@@ -75,7 +76,7 @@ When you call `Pool::new()`:
 
 1. The topology is read from `/sys/devices/system/cpu`: the physical core of every logical CPU, its hyper-threading siblings, and the cache parameters.
 2. By default, **one worker thread per physical core** is started, not one per logical CPU. On the i7-8750H that is 6 threads on CPUs `0–5`. The other halves of the pairs (`6–11`) are left alone: two pool threads on the same core would share L1 and L2 and evict each other's data.
-3. Each worker is pinned to a single logical CPU via `sched_setaffinity`, so the scheduler no longer moves it to other cores. The system can still preempt it temporarily for another process, and other programs can still use the idle hyper-threading sibling — the pool does not control that.
+3. Each worker is pinned to a single logical CPU via `sched_setaffinity` (`pin_to`), so the scheduler no longer moves it to other cores. The system can still preempt it temporarily for another process, and other programs can still use the idle hyper-threading sibling — the pool does not control that.
 4. Each worker has two task queues:
    - a **shared** queue for `execute`; other workers may take tasks from it;
    - a **pinned** queue for `execute_on`; these tasks run only on their own core.
@@ -136,49 +137,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("logical CPUs: {}", topology.cpus.len());
     println!("L2 per core: {:?} bytes", topology.l2_size_bytes());
 
+    // The same call each worker makes at startup. `cpu` is a logical CPU id.
+    warm_core::pin_to(0)?;
+
     Ok(())
 }
 ```
 
 If the pool has no such core, `execute_on` returns `PoolError::UnknownCore`.
 
+`pin_to` is public, so other threads — the Rayon workers in `examples/compare.rs`, for instance — can be pinned with the same system call the pool uses.
+
 A closure passed to the pool must be `Send + 'static`: it runs on another thread, so it cannot borrow local variables of the calling code. Move the data it needs inside with `move`.
 
 ### What the benchmark shows
 
-The benchmark lives in `examples/compare.rs`. Built with `--release` on an Intel Core i7-8750H (6 cores, 12 threads, 256 KiB of L2 per core).
+The benchmark lives in `examples/compare.rs`. Built with `--release` on an Intel Core i7-8750H (6 cores, 12 threads, 256 KiB of L2 per core). Rayon is a dev-dependency of the example and the criterion benchmark; the library itself still depends only on `libc`.
 
-Both variants do identical work:
+All three variants do identical work:
 
 - there are twice as many tasks as logical CPUs — 24 on this machine;
 - each task has its own buffer the size of one core's L2 — 256 KiB here;
 - each task makes 40 passes over its buffer, incrementing every byte by 1 and accumulating a checksum along the way;
-- at the end the checksums of both variants are compared: this keeps the compiler from optimizing the work away and confirms the results match.
+- at the end the checksums of all three variants are compared: this keeps the compiler from optimizing the work away and confirms the results match.
 
-The only difference is how the work is laid out on the processor.
+Each variant uses 6 workers, one per physical core. The pools are created before the timer starts, and no task calls `yield_now` between passes.
 
-**The baseline** spawns 24 separate `std::thread`s — four times as many as there are physical cores. After each pass a thread calls `yield_now()` and gives up the CPU. Another thread with its own L2-sized buffer takes its place and evicts the previous thread's data. When the first thread comes back, its next pass starts with a "cold" cache. On top of that, the threads are not pinned, so the scheduler is free to move them between cores.
+**Rayon, no affinity** is a Rayon pool of 6 threads. The tasks are one `into_par_iter`. The kernel may move those threads from core to core.
 
-**`warm_core`** runs the same 24 tasks on 6 pre-spawned threads, one per physical core. Nobody gives up the CPU between passes, so a task's buffer stays in its core's cache for all 40 passes. The next task on that core starts only after the previous one has finished.
+**Rayon + affinity** is the same pool and the same `into_par_iter`. As each worker starts, it calls `pin_to` on one CPU from `Pool::pinned_cpus()` — on this machine, CPUs 0–5. The only difference from the first pool is the `sched_setaffinity` mask.
+
+**`warm_core`** uses those same six CPUs. Tasks are submitted with `execute` and collected with `wait`. Each worker drains its own queue in batches before it looks at another core's queue.
+
+An earlier run of this example compared 24 `std::thread`s that called `yield_now` after every pass (37 ms) with the pool (31 ms, about 1.2×). That number mixed oversubscription, extra context switches, and the cost of spawning threads. The figures below replace it.
 
 Results:
 
-| | `std::thread` + `yield_now` | `warm_core` |
-|---|---:|---:|
-| Time | 37 ms | 31 ms |
-| Speedup | 1.0 | **1.2** |
+| | Rayon | Rayon + affinity | `warm_core` |
+|---|---:|---:|---:|
+| Time | 37.7 ms | 39.5 ms | 26.6 ms |
+| Versus Rayon | 1.0 | 0.95 | **1.4** |
 
 How to read these numbers:
 
-- The pool finished 6 ms earlier: `37 − 31 = 6`.
-- Speedup: `37 / 31 ≈ 1.19`, rounded to 1.2.
-- If you ran this batch continuously, the baseline would complete about 27 batches per second (`1000 / 37`) and the pool about 32 (`1000 / 31`), i.e. roughly 19% more.
+- The pinned Rayon pool took about 1.8 ms longer: `39.5 − 37.7 = 1.8`. The ratio `37.7 / 39.5 ≈ 0.95` means the pin did not speed this run up.
+- `warm_core` finished 11 ms earlier than unpinned Rayon: `37.7 − 26.6 = 11.1`. Speedup: `37.7 / 26.6 ≈ 1.42`, rounded to 1.4. It was also faster than pinned Rayon (`39.5 / 26.6 ≈ 1.5`).
+- If you ran this batch continuously, unpinned Rayon would complete about 27 batches per second (`1000 / 37.7`) and the pool about 38 (`1000 / 26.6`).
 
 Important caveats:
 
-- The difference is not only about caches. The baseline's measured time includes spawning 24 threads, whereas the pool is created before the timer starts. The baseline also adds its own context switches via `yield_now`. This is a comparison against a deliberately poor way of parallelizing, not against a well-tuned pool such as `rayon`.
-- This is a single short run on a single machine. On a different processor, with different cache sizes, or under background load the numbers will differ, so 1.2 is not a guaranteed result.
-- The pool helps most when a task re-reads the same data many times and, without the pool, threads would often switch and migrate between cores. If a task streams through memory once and never comes back to it, keeping the cache warm buys almost nothing.
+- The two Rayon columns share a scheduler and a thread count, so the gap between them is the affinity mask. On this run that gap is small and points the wrong way for a "pin makes it faster" reading. `warm_core` was faster than both, which points at its queues and batched local execution.
+- Each task allocates its buffer on the worker that runs it and then scans that buffer 40 times without yielding. A pin and a local queue are doing different jobs here. The Rayon pair is the pin. The shorter `warm_core` time is how the 24 tasks are handed out.
+- This is a single short run on a single machine. On a different processor, with different cache sizes, or under background load the numbers will differ, so 1.4 and 0.95 are not guaranteed results.
+- A pin pays off when the kernel would otherwise move a busy thread to another core. This run did not show that cost. Keeping a cache warm matters when the same bytes are scanned many times and something else would evict them between passes. A single streaming pass over memory has little to gain from either.
 
 To reproduce:
 
@@ -186,7 +197,7 @@ To reproduce:
 cargo run --release --example compare
 ```
 
-The example prints the number of logical CPUs and pool workers, the buffer size, the list of CPUs the workers are pinned to, and the time of both variants.
+The example prints the number of logical CPUs and pool workers, the buffer size, the list of CPUs the workers are pinned to, and the time of all three variants.
 
 Hardware counters via `perf` help explain where the difference comes from. Build the example first and run the binary directly, otherwise `cargo` itself ends up in the statistics:
 
@@ -196,7 +207,7 @@ perf stat -e L1-dcache-load-misses,LLC-load-misses,context-switches,cpu-migratio
   ./target/release/examples/compare
 ```
 
-The counters cover the whole process, i.e. both variants together. To compare them separately, temporarily comment one of them out in `examples/compare.rs`. Expect the baseline to show noticeably more `context-switches` and `cpu-migrations`: its threads give up the CPU themselves and the scheduler puts them wherever it can. Pool workers are each pinned to a single CPU and do not migrate between cores.
+The counters cover the whole process, i.e. all three variants together. To compare them separately, temporarily comment two of them out in `examples/compare.rs`. Pinned workers stay on one CPU each, so a pinned run should record fewer `cpu-migrations` than the unpinned Rayon pool.
 
 The same scenario is also available as a criterion benchmark:
 
@@ -204,7 +215,7 @@ The same scenario is also available as a criterion benchmark:
 cargo bench
 ```
 
-It uses 8 passes instead of 40, and the number of tasks is derived from `available_parallelism()`. Criterion repeats the runs and estimates the spread. The example in `examples/` is easier to read; the benchmark gives more reliable numbers.
+It uses 8 passes instead of 40, and the number of tasks is derived from `available_parallelism()`. The three functions are `rayon`, `rayon_affinity`, and `warm_core`. Criterion repeats the runs and estimates the spread. The example in `examples/` is easier to read; the benchmark gives more reliable numbers.
 
 ### Tests
 
@@ -236,10 +247,10 @@ Topology and pinning:
 | File | Contents |
 |---|---|
 | `src/topology.rs` | Reads cores, hyper-threading pairs and caches from `/sys` |
-| `src/affinity.rs` | Pins a thread to a single CPU |
+| `src/affinity.rs` | Pins a thread to a single CPU (`pin_to`) |
 | `src/queue.rs` | Task queue with positions on separate cache lines |
 | `src/pool.rs` | The pool itself: two queues per core, batched execution, `execute` and `execute_on` |
-| `examples/compare.rs` | Comparison against plain threads |
+| `examples/compare.rs` | Rayon with and without affinity, plus `warm_core` |
 | `benches/locality.rs` | The same comparison using criterion |
 
 ### Limitations
@@ -260,10 +271,11 @@ The crate works on Linux only: it needs `/sys/devices/system/cpu` and `sched_set
 
 | Вариант | Время |
 |---|---|
-| Обычные потоки `std::thread`, после каждого прохода `yield_now` | 37 мс |
-| `warm_core` | 31 мс |
+| Rayon, 6 потоков, без affinity | 37.7 мс |
+| Rayon, 6 потоков, с той же привязкой, что у пула | 39.5 мс |
+| `warm_core` | 26.6 мс |
 
-Пул справился примерно в **1.2 раза быстрее**: на 6 мс, или около 16% времени, меньше. Обе версии посчитали одинаковые контрольные суммы, так что работа действительно одна и та же. Подробности замера и оговорки к нему — в разделе [«Что показал замер»](#что-показал-замер).
+Сама маска affinity работу не сократила: привязанный Rayon показал **0.95×**. `warm_core` справился примерно в **1.4 раза быстрее** непривязанного Rayon, на 11 мс меньше, и обогнал привязанный Rayon тоже. Все три варианта посчитали одинаковые контрольные суммы, так что работа действительно одна и та же. Подробности замера и оговорки к нему — в разделе [«Что показал замер»](#что-показал-замер).
 
 `cargo test` проходит: 12 тестов библиотеки и 1 doctest.
 
@@ -311,7 +323,7 @@ The crate works on Linux only: it needs `/sys/devices/system/cpu` and `sched_set
 
 Ещё хуже, если планировщик переносит поток на **другое физическое ядро**. L1 и L2 там свои, и всё, что было «тёплым» на старом ядре, на новом приходится загружать заново. Часть данных может найтись в общем L3, но он заметно медленнее и тоже вытесняется чужими данными.
 
-Обычная программа не может запретить операционной системе вытеснять свои потоки. Зато можно сделать так, чтобы поток никогда не переезжал на другое ядро и чтобы задача не отдавала ядро посреди работы. Именно этим и занимается `warm_core`.
+Обычная программа не может запретить операционной системе вытеснять свои потоки. Зато можно привязать поток к одному ядру и не отдавать это ядро посреди задачи. `warm_core` делает и то и другое. Замер ниже гоняет один и тот же пул Rayon с привязкой и без неё, так что маска и собственные очереди пула видны по отдельности.
 
 ### Как устроен пул
 
@@ -319,7 +331,7 @@ The crate works on Linux only: it needs `/sys/devices/system/cpu` and `sched_set
 
 1. Из `/sys/devices/system/cpu` читается топология: номер физического ядра у каждого логического CPU, его соседи по hyper-threading и параметры кэшей.
 2. По умолчанию запускается **по одному рабочему потоку на физическое ядро**, а не на каждый логический CPU. На i7-8750H это 6 потоков на CPU `0–5`. Вторые половины пар (`6–11`) пул не занимает: два потока пула на одном ядре делили бы L1 и L2 и вытесняли бы данные друг друга.
-3. Каждый рабочий поток привязывается к одному логическому CPU через `sched_setaffinity`, и планировщик больше не переносит его на другие ядра. Вытеснить его на время другим процессом система по-прежнему может, и свободный «сосед» по hyper-threading тоже могут занять другие программы — пул этим не управляет.
+3. Каждый рабочий поток привязывается к одному логическому CPU через `sched_setaffinity` (`pin_to`), и планировщик больше не переносит его на другие ядра. Вытеснить его на время другим процессом система по-прежнему может, и свободный «сосед» по hyper-threading тоже могут занять другие программы — пул этим не управляет.
 4. У каждого рабочего потока две очереди задач:
    - **общая** — для `execute`; из неё задачи может забрать другой поток;
    - **закреплённая** — для `execute_on`; эти задачи выполняются только на своём ядре.
@@ -380,49 +392,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("логических CPU: {}", topology.cpus.len());
     println!("L2 одного ядра: {:?} байт", topology.l2_size_bytes());
 
+    // Тот же вызов, который каждый рабочий поток делает при старте.
+    // `cpu` — номер логического CPU.
+    warm_core::pin_to(0)?;
+
     Ok(())
 }
 ```
 
 Если в пуле нет указанного ядра, `execute_on` вернёт `PoolError::UnknownCore`.
 
+`pin_to` публичный: тем же системным вызовом, что и пул, можно привязать и чужие потоки. Так пример `examples/compare.rs` закрепляет рабочие потоки Rayon.
+
 Замыкание, которое передаётся в пул, должно быть `Send + 'static`: его выполняет другой поток, поэтому оно не может ссылаться на локальные переменные вызывающего кода. Нужные данные передаются внутрь через `move`.
 
 ### Что показал замер
 
-Замер лежит в `examples/compare.rs`. Сборка `--release`, процессор Intel Core i7-8750H (6 ядер, 12 потоков, L2 256 КБ на ядро).
+Замер лежит в `examples/compare.rs`. Сборка `--release`, процессор Intel Core i7-8750H (6 ядер, 12 потоков, L2 256 КБ на ядро). Rayon — dev-зависимость примера и бенчмарка criterion; сама библиотека по-прежнему зависит только от `libc`.
 
-Обе версии выполняют одинаковую работу:
+Все три варианта выполняют одинаковую работу:
 
 - задач вдвое больше, чем логических CPU, — на этой машине 24;
 - у каждой задачи свой буфер размером с L2 одного ядра — здесь 256 КБ;
 - задача 40 раз проходит по буферу, увеличивает каждый байт на 1 и попутно считает контрольную сумму;
-- в конце суммы обеих версий сравниваются: так компилятор не выбросит вычисления, а мы убеждаемся, что результат одинаковый.
+- в конце суммы всех трёх вариантов сравниваются: так компилятор не выбросит вычисления, а мы убеждаемся, что результат одинаковый.
 
-Различается только то, как эта работа распределена по процессору.
+В каждом варианте 6 рабочих потоков, по одному на физическое ядро. Пулы создаются до начала замера, и между проходами никто не вызывает `yield_now`.
 
-**Базовая версия** запускает 24 отдельных потока `std::thread` — в четыре раза больше, чем физических ядер. После каждого прохода поток вызывает `yield_now()` и уступает процессор. На его место садится другой поток со своим буфером размером со всю L2 и вытесняет данные предыдущего. Когда первый поток возвращается, следующий проход начинается с «холодного» кэша. Вдобавок потоки не привязаны к ядрам, и планировщик может переносить их с ядра на ядро.
+**Rayon без affinity** — пул Rayon из 6 потоков. Задачи — один `into_par_iter`. Планировщик может переносить эти потоки с одного ядра процессора на другое.
 
-**`warm_core`** выполняет те же 24 задачи на 6 заранее созданных потоках, по одному на физическое ядро. Процессор между проходами никто не отдаёт, поэтому буфер задачи остаётся в кэше её ядра все 40 проходов. Следующая задача на этом ядре начинается, только когда предыдущая закончилась.
+**Rayon с affinity** — тот же пул и тот же `into_par_iter`. При старте каждый поток вызывает `pin_to` для одного CPU из `Pool::pinned_cpus()` — на этой машине это CPU 0–5. От первого пула его отличает только маска `sched_setaffinity`.
+
+**`warm_core`** занимает те же шесть CPU. Задачи отправляются через `execute` и забираются через `wait`. Каждый поток сначала доделывает свою очередь пачками и только потом смотрит в очередь другого ядра.
+
+Прежний прогон этого примера сравнивал 24 потока `std::thread` с `yield_now` после каждого прохода (37 мс) и пул (31 мс, около 1.2×). В ту цифру попадали переподписка, лишние переключения и создание потоков. Ниже — цифры, которые её заменяют.
 
 Результат:
 
-| | `std::thread` + `yield_now` | `warm_core` |
-|---|---:|---:|
-| Время | 37 мс | 31 мс |
-| Ускорение | 1.0 | **1.2** |
+| | Rayon | Rayon + affinity | `warm_core` |
+|---|---:|---:|---:|
+| Время | 37.7 мс | 39.5 мс | 26.6 мс |
+| Относительно Rayon | 1.0 | 0.95 | **1.4** |
 
 Как читать эти цифры:
 
-- Пул закончил на 6 мс раньше: `37 − 31 = 6`.
-- Ускорение: `37 / 31 ≈ 1.19`, после округления 1.2.
-- Если запускать такую пачку непрерывно, базовая версия успеет около 27 пачек в секунду (`1000 / 37`), а пул — около 32 (`1000 / 31`), то есть примерно на 19% больше.
+- Привязанный пул Rayon потратил примерно на 1.8 мс больше: `39.5 − 37.7 = 1.8`. Отношение `37.7 / 39.5 ≈ 0.95` значит, что привязка этот прогон не ускорила.
+- `warm_core` закончил на 11 мс раньше непривязанного Rayon: `37.7 − 26.6 = 11.1`. Ускорение: `37.7 / 26.6 ≈ 1.42`, после округления 1.4. Он быстрее и привязанного Rayon (`39.5 / 26.6 ≈ 1.5`).
+- Если запускать такую пачку непрерывно, непривязанный Rayon успеет около 27 пачек в секунду (`1000 / 37.7`), а пул — около 38 (`1000 / 26.6`).
 
 Важные оговорки:
 
-- Разница складывается не только из кэша. В измеренное время базовой версии входит создание 24 потоков, а пул создаётся до начала замера. Кроме того, база сама добавляет переключения через `yield_now`. Это сравнение с заведомо неудачным способом распараллеливания, а не с хорошо настроенным пулом вроде `rayon`.
-- Это один короткий прогон на одной машине. На другом процессоре, с другими размерами кэшей или под фоновой нагрузкой цифры будут другими, поэтому 1.2 — не гарантированный результат.
-- Пользы будет больше там, где задача многократно перечитывает одни и те же данные, а без пула потоки часто переключаются и переезжают между ядрами. Если задача один раз проходит по памяти и больше к ней не возвращается, удерживать кэш тёплым почти бессмысленно.
+- У двух колонок Rayon один и тот же планировщик и одно и то же число потоков, поэтому разница между ними — это маска affinity. На этом прогоне она маленькая и в сторону замедления. `warm_core` быстрее обоих пулов Rayon, и это уже его очереди и выполнение пачками.
+- Каждая задача выделяет буфер на том потоке, который её выполняет, и 40 раз проходит по нему, не отдавая процессор. Привязка и локальная очередь здесь делают разную работу. Пара Rayon — это привязка. Более короткое время `warm_core` — это то, как раздаются 24 задачи.
+- Это один короткий прогон на одной машине. На другом процессоре, с другими размерами кэшей или под фоновой нагрузкой цифры будут другими, поэтому 1.4 и 0.95 — не гарантированный результат.
+- Привязка окупается, когда ядро системы иначе перенесло бы занятый поток на другое ядро процессора. Этот прогон такой цены не показал. Держать кэш тёплым имеет смысл, когда одни и те же байты читаются много раз и между проходами их кто-то вытесняет. Один сквозной проход по памяти почти ничего не выигрывает ни от привязки, ни от очередей.
 
 Повторить замер:
 
@@ -430,7 +453,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 cargo run --release --example compare
 ```
 
-Пример выведет число логических CPU и рабочих потоков пула, размер буфера, список CPU, за которыми закреплены потоки, и время обеих версий.
+Пример выведет число логических CPU и рабочих потоков пула, размер буфера, список CPU, за которыми закреплены потоки, и время всех трёх вариантов.
 
 Понять, откуда берётся разница, помогают аппаратные счётчики через `perf`. Пример лучше собрать заранее и запускать готовый бинарник, иначе в статистику попадёт и сам `cargo`:
 
@@ -440,7 +463,7 @@ perf stat -e L1-dcache-load-misses,LLC-load-misses,context-switches,cpu-migratio
   ./target/release/examples/compare
 ```
 
-Счётчики собираются по всему процессу сразу, то есть по обеим версиям вместе. Чтобы сравнить версии по отдельности, временно закомментируйте одну из них в `examples/compare.rs`. Стоит ожидать, что у базовой версии будет заметно больше `context-switches` и `cpu-migrations`: потоки сами уступают процессор, а планировщик сажает их куда получится. Потоки пула привязаны к одному CPU каждый и между ядрами не переезжают.
+Счётчики собираются по всему процессу сразу, то есть по всем трём вариантам вместе. Чтобы сравнить варианты по отдельности, временно закомментируйте два из них в `examples/compare.rs`. Привязанные потоки остаются на одном CPU каждый, поэтому у такого прогона `cpu-migrations` должно быть меньше, чем у непривязанного Rayon.
 
 Тот же сценарий есть в виде бенчмарка на criterion:
 
@@ -448,7 +471,7 @@ perf stat -e L1-dcache-load-misses,LLC-load-misses,context-switches,cpu-migratio
 cargo bench
 ```
 
-Там 8 проходов вместо 40, а число задач считается от `available_parallelism()`. Criterion сам повторяет прогоны и оценивает разброс. Пример из `examples/` проще читать, а бенчмарк даёт более надёжные цифры.
+Там 8 проходов вместо 40, а число задач считается от `available_parallelism()`. Три функции — `rayon`, `rayon_affinity` и `warm_core`. Criterion сам повторяет прогоны и оценивает разброс. Пример из `examples/` проще читать, а бенчмарк даёт более надёжные цифры.
 
 ### Тесты
 
@@ -480,10 +503,10 @@ cargo bench
 | Файл | Что внутри |
 |---|---|
 | `src/topology.rs` | Чтение ядер, пар hyper-threading и кэшей из `/sys` |
-| `src/affinity.rs` | Привязка потока к одному CPU |
+| `src/affinity.rs` | Привязка потока к одному CPU (`pin_to`) |
 | `src/queue.rs` | Очередь задач с позициями на разных кэш-линиях |
 | `src/pool.rs` | Сам пул: две очереди на ядро, выполнение пачками, `execute` и `execute_on` |
-| `examples/compare.rs` | Сравнение с обычными потоками |
+| `examples/compare.rs` | Rayon с affinity и без неё, плюс `warm_core` |
 | `benches/locality.rs` | То же сравнение на criterion |
 
 ### Ограничения

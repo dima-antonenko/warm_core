@@ -10,6 +10,7 @@ libc = "0.2"
 
 [dev-dependencies]
 criterion = "0.5"
+rayon = "1"
 
 [[bench]]
 name = "locality"
