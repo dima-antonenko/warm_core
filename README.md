@@ -88,6 +88,8 @@ Each worker then runs a simple loop:
 2. If it has no tasks of its own, it tries to take one from a neighbour's shared queue, starting with the busiest. It never touches other cores' pinned tasks: those were sent to a specific core precisely for its cache.
 3. If there is no work anywhere, it goes to sleep (`park`) until a new task is pushed into its queue.
 
+The quota, and why the count has to survive a batch boundary, is written up in [FAIRNESS.md](FAIRNESS.md).
+
 `Layout::LogicalCpus` starts a worker on every logical CPU, including the second halves of hyper-threading pairs. It can be useful when tasks barely depend on the cache. If a task's working set is comparable to L2, the default layout is usually the better choice.
 
 ### Life of a task
@@ -222,7 +224,7 @@ It uses 8 passes instead of 40, and the number of tasks is derived from `availab
 
 ### Tests
 
-`cargo test` runs 12 library tests and the doc example in `src/lib.rs`.
+`cargo test` runs 13 library tests and the doc example in `src/lib.rs`.
 
 Queue:
 
@@ -237,7 +239,8 @@ Pool:
 - each worker may run on exactly one CPU — the one it is pinned to;
 - `execute_on` with a nonexistent core returns an error;
 - a panic in a task does not stop the worker;
-- in `LogicalCpus` mode a worker is started on every logical CPU.
+- in `LogicalCpus` mode a worker is started on every logical CPU;
+- a shared task still starts within `pinned_per_shared` pinned tasks when that worker's pinned queue is kept full. See [FAIRNESS.md](FAIRNESS.md).
 
 Topology and pinning:
 
@@ -258,6 +261,7 @@ Topology and pinning:
 | `benches/locality.rs` | The same comparison using criterion |
 | `BENCHMARK.md` | Why the comparison changed, and what the run showed |
 | `QUEUE.md` | Why `len` grows before a slot is published, and how Loom checks it |
+| `FAIRNESS.md` | Why a steady pinned load leaves a slot for the shared queue |
 
 ### Limitations
 
@@ -348,6 +352,8 @@ The crate works on Linux only: it needs `/sys/devices/system/cpu` and `sched_set
 1. Выполняет подряд до 32 задач из своих очередей. Пока задачи есть в обеих, он берёт три закреплённые и затем одну общую (`Config::pinned_per_shared`, по умолчанию 3). Пустая очередь не сжигает свой слот. Счётчик не обнуляется на границе пачки, поэтому короткая пачка не морит общую очередь голодом. В это время он не смотрит на соседей, и ядро работает с одним и тем же набором данных.
 2. Если своих задач нет, пробует забрать задачу из общей очереди соседа, начиная с самого загруженного. Закреплённые задачи чужих ядер не трогает: их отправили на конкретное ядро как раз ради его кэша.
 3. Если работы нет нигде, засыпает (`park`) до тех пор, пока в его очередь не положат новую задачу.
+
+Квота и то, почему счётчик должен переживать границу пачки, разобраны в [FAIRNESS.md](FAIRNESS.md).
 
 Режим `Layout::LogicalCpus` запускает рабочий поток на каждом логическом CPU, включая вторые половины пар hyper-threading. Он может пригодиться, когда задачи почти не зависят от кэша. Если рабочий набор задачи сравним с L2, режим по умолчанию обычно выгоднее.
 
@@ -484,7 +490,7 @@ cargo bench
 
 ### Тесты
 
-`cargo test` запускает 12 тестов библиотеки и пример из документации в `src/lib.rs`.
+`cargo test` запускает 13 тестов библиотеки и пример из документации в `src/lib.rs`.
 
 Очередь:
 
@@ -499,7 +505,8 @@ cargo bench
 - каждый рабочий поток может исполняться ровно на одном CPU — на том, за которым он закреплён;
 - `execute_on` с несуществующим ядром возвращает ошибку;
 - паника в задаче не останавливает рабочий поток;
-- в режиме `LogicalCpus` рабочий поток запускается на каждом логическом CPU.
+- в режиме `LogicalCpus` рабочий поток запускается на каждом логическом CPU;
+- общая задача всё равно стартует в пределах `pinned_per_shared` закреплённых, когда закреплённая очередь этого потока не пустеет. См. [FAIRNESS.md](FAIRNESS.md).
 
 Топология и привязка:
 
@@ -520,6 +527,7 @@ cargo bench
 | `benches/locality.rs` | То же сравнение на criterion |
 | `BENCHMARK.md` | Почему сравнение поменялось и что показал прогон |
 | `QUEUE.md` | Почему `len` растёт до публикации слота и как это проверяет Loom |
+| `FAIRNESS.md` | Почему постоянный поток закреплённых задач оставляет слот общей очереди |
 
 ### Ограничения
 
