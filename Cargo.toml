@@ -12,6 +12,13 @@ libc = "0.2"
 criterion = "0.5"
 rayon = "1"
 
+# Атомики очереди подменяются на loom, когда сборка идёт с `--cfg loom`.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 [[bench]]
 name = "locality"
 harness = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

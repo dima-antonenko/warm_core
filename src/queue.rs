@@ -4,8 +4,11 @@
 //! инвалидирует линию, которую в тот же момент читает worker, и ядра
 //! гоняют одну линию через L3 туда-сюда (false sharing).
 
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicUsize, Ordering};
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
+#[cfg(not(loom))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Поле, которое занимает целую линию и не делит её с соседом.
@@ -84,8 +87,13 @@ impl<T> Queue<T> {
                         unsafe {
                             (*slot.value.get()).write(value);
                         }
-                        slot.sequence.store(pos.wrapping_add(1), Ordering::Release);
+                        // Длина растёт до публикации слота. Иначе pop успевает
+                        // сделать fetch_sub раньше этого fetch_add, и счётчик
+                        // на мгновение становится usize::MAX: ядро выглядит
+                        // самым загруженным. Acquire в pop читает этот Release,
+                        // поэтому уменьшение длины случается строго позже.
                         self.len.value.fetch_add(1, Ordering::Relaxed);
+                        slot.sequence.store(pos.wrapping_add(1), Ordering::Release);
                         return Ok(());
                     }
                     Err(actual) => pos = actual,
@@ -136,7 +144,7 @@ impl<T> Drop for Queue<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use std::mem::align_of;
@@ -239,5 +247,44 @@ mod tests {
         values.sort_unstable();
         let expected = (0..total).collect::<Vec<_>>();
         assert_eq!(values, expected);
+    }
+}
+
+/// `RUSTFLAGS="--cfg loom" cargo test --lib --release len_does_not_underflow -- --test-threads=1`
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::Queue;
+    use std::sync::Arc;
+
+    #[test]
+    fn len_does_not_underflow_on_handoff() {
+        loom::model(|| {
+            let queue = Arc::new(Queue::new(2));
+
+            let pushed = Arc::clone(&queue);
+            let producer = loom::thread::spawn(move || {
+                pushed.push(1).unwrap();
+            });
+
+            let popped = Arc::clone(&queue);
+            let consumer = loom::thread::spawn(move || {
+                loop {
+                    if let Some(value) = popped.pop() {
+                        break value;
+                    }
+                    loom::thread::yield_now();
+                }
+            });
+
+            // Один замер. Loom ставит его между атомными операциями push и pop.
+            let observed = Arc::clone(&queue);
+            let observer = loom::thread::spawn(move || observed.len());
+
+            producer.join().unwrap();
+            assert_eq!(consumer.join().unwrap(), 1);
+            let len = observer.join().unwrap();
+            assert!(len <= 1, "длина ушла ниже нуля и обернулась в {len}");
+            assert_eq!(queue.len(), 0);
+        });
     }
 }
