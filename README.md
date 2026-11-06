@@ -152,6 +152,8 @@ A closure passed to the pool must be `Send + 'static`: it runs on another thread
 
 ### What the benchmark shows
 
+How this comparison was put together, and why the old 37 ms / 31 ms figure was retired, is written up in [BENCHMARK.md](BENCHMARK.md).
+
 The benchmark lives in `examples/compare.rs`. Built with `--release` on an Intel Core i7-8750H (6 cores, 12 threads, 256 KiB of L2 per core). Rayon is a dev-dependency of the example and the criterion benchmark; the library itself still depends only on `libc`.
 
 All three variants do identical work:
@@ -252,6 +254,7 @@ Topology and pinning:
 | `src/pool.rs` | The pool itself: two queues per core, batched execution, `execute` and `execute_on` |
 | `examples/compare.rs` | Rayon with and without affinity, plus `warm_core` |
 | `benches/locality.rs` | The same comparison using criterion |
+| `BENCHMARK.md` | Why the comparison changed, and what the run showed |
 
 ### Limitations
 
@@ -408,6 +411,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Что показал замер
 
+Как собрано это сравнение и почему старые 37 мс / 31 мс больше не цитируются как результат, записано в [BENCHMARK.md](BENCHMARK.md).
+
 Замер лежит в `examples/compare.rs`. Сборка `--release`, процессор Intel Core i7-8750H (6 ядер, 12 потоков, L2 256 КБ на ядро). Rayon — dev-зависимость примера и бенчмарка criterion; сама библиотека по-прежнему зависит только от `libc`.
 
 Все три варианта выполняют одинаковую работу:
@@ -508,6 +513,7 @@ cargo bench
 | `src/pool.rs` | Сам пул: две очереди на ядро, выполнение пачками, `execute` и `execute_on` |
 | `examples/compare.rs` | Rayon с affinity и без неё, плюс `warm_core` |
 | `benches/locality.rs` | То же сравнение на criterion |
+| `BENCHMARK.md` | Почему сравнение поменялось и что показал прогон |
 
 ### Ограничения
 
