@@ -76,6 +76,7 @@ type Task = Box<dyn FnOnce() + Send + 'static>;
 
 struct Worker {
     cpu: usize,
+    numa_node: u32,
     core_id: CoreId,
     /// `execute_on`: с этого ядра задачу не крадут, данные остаются в его L1/L2.
     pinned: Queue<Task>,
@@ -164,6 +165,7 @@ impl Pool {
             .zip(pinned_gates_of)
             .map(|(cpu, pinned_gate)| Worker {
                 cpu: cpu.logical_id,
+                numa_node: cpu.numa_node,
                 core_id: cpu.core_id,
                 pinned: Queue::new(QUEUE_CAPACITY),
                 shared: Queue::new(QUEUE_CAPACITY),
@@ -240,8 +242,12 @@ impl Pool {
 
     /// Кладёт задачу в общую очередь наименее загруженного ядра.
     ///
-    /// При равной длине очереди обходятся по кругу, а не липнут к нулевому ядру.
-    /// Если слот есть у соседа, задача уходит туда. Когда свободного слота нет,
+    /// При равной длине сначала берётся узел NUMA вызывающего потока, затем круг,
+    /// чтобы серия не липла к нулевому ядру. Если слот есть у соседа, задача
+    /// уходит туда. Простаивающий сосед может забрать её и позже: общая очередь
+    /// для этого и есть. Буфер, прогретый на одном ядре, следующий `execute`
+    /// не обязан прочитать там же. Для этого есть [`Self::execute_on`].
+    /// Когда свободного слота нет,
     /// вызов ждёт не дольше [`Config::submit_timeout`] и возвращает
     /// [`PoolError::QueueFull`]. Замыкание к этому моменту уже забрано.
     pub fn execute<F, T>(&self, f: F) -> Result<JobHandle<T>, PoolError>
@@ -265,8 +271,11 @@ impl Pool {
 
     /// Оставляет задачу на ядре, где её данные уже горячие.
     ///
-    /// В режиме [`Layout::LogicalCpus`] пробует обоих worker этого ядра,
-    /// начиная с менее загруженного. Ожидание ограничено [`Config::submit_timeout`].
+    /// Задача попадает в закреплённую очередь, и простаивающий сосед её не крадёт:
+    /// он читает только общую очередь. Повторный вызов с тем же [`CoreId`] снова
+    /// исполняется на этом ядре. В режиме [`Layout::LogicalCpus`]
+    /// пробует обоих worker этого ядра, начиная с менее загруженного.
+    /// Ожидание ограничено [`Config::submit_timeout`].
     pub fn execute_on<F, T>(&self, core: CoreId, f: F) -> Result<JobHandle<T>, PoolError>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -390,30 +399,41 @@ fn unpark_worker(worker: &Worker) {
     }
 }
 
-/// Меньшая очередь раньше. При равенстве старт сдвигается по кругу,
-/// чтобы серия задач не липла к одному и тому же ядру.
+/// Меньшая очередь раньше. При равной длине раньше идёт узел NUMA
+/// вызывающего потока: привязка к CPU не переносит уже выделенные страницы,
+/// и задаче ближе память того узла, где её поставили. Внутри этой группы
+/// старт сдвигается по кругу, чтобы серия задач не липла к одному ядру.
 ///
 /// Длины снимаются один раз: пока идёт сортировка, worker может забрать
 /// задачу, и сравнение по живой длине перестало бы быть порядком.
 fn ordered_targets(inner: &Inner, candidates: &[usize]) -> Vec<usize> {
-    let mut ranked: Vec<(usize, usize)> = candidates
+    let local = affinity::current_numa_node();
+    let mut ranked: Vec<(usize, u8, usize)> = candidates
         .iter()
         .copied()
-        .map(|index| (worker_load(&inner.workers[index]), index))
+        .map(|index| {
+            let worker = &inner.workers[index];
+            let remote = match local {
+                Some(node) if worker.numa_node == node => 0,
+                Some(_) => 1,
+                None => 0,
+            };
+            (worker_load(worker), remote, index)
+        })
         .collect();
     ranked.sort_by_key(|&item| item);
     if ranked.len() > 1 {
-        let best = ranked[0].0;
+        let (best_load, best_remote, _) = ranked[0];
         let tie_end = ranked
             .iter()
-            .position(|(load, _)| *load != best)
+            .position(|(load, remote, _)| *load != best_load || *remote != best_remote)
             .unwrap_or(ranked.len());
         if tie_end > 1 {
             let ticket = inner.rr.fetch_add(1, Ordering::Relaxed);
             ranked[..tie_end].rotate_left(ticket % tie_end);
         }
     }
-    ranked.into_iter().map(|(_, index)| index).collect()
+    ranked.into_iter().map(|(_, _, index)| index).collect()
 }
 
 fn push_once(
@@ -452,10 +472,14 @@ fn stop(inner: &Inner, joins: Vec<JoinHandle<()>>) {
 
 fn worker_entry(inner: Arc<Inner>, index: usize, started: Sender<io::Result<()>>) {
     let cpu = inner.workers[index].cpu;
+    let node = inner.workers[index].numa_node;
     if let Err(err) = affinity::pin_to(cpu) {
         let _ = started.send(Err(err));
         return;
     }
+    // Память новых страниц — на узле этого CPU. Отказ syscall пул не останавливает:
+    // привязка уже стоит, а песочница может запрещать set_mempolicy.
+    let _ = affinity::prefer_node(node);
     {
         let mut wake = inner.workers[index].wake.lock().unwrap();
         *wake = Some(thread::current());
@@ -848,6 +872,41 @@ mod tests {
         }
         let full = pool.try_execute_on(core, || 1);
         assert!(matches!(full, Err(PoolError::QueueFull)));
+        drop(guard);
+    }
+
+    #[test]
+    fn pinned_task_is_not_stolen_while_a_shared_one_is() {
+        let pool = Pool::new().unwrap();
+        if pool.worker_count() < 2 {
+            return;
+        }
+        let guard = block_workers(&pool);
+        let shared_ran = Arc::new(AtomicBool::new(false));
+        let pinned_ran = Arc::new(AtomicBool::new(false));
+        let shared_flag = Arc::clone(&shared_ran);
+        pool.submit(&[0], false, true, move || {
+            shared_flag.store(true, Ordering::Release);
+        })
+        .unwrap();
+        let pinned_flag = Arc::clone(&pinned_ran);
+        pool.submit(&[0], true, true, move || {
+            pinned_flag.store(true, Ordering::Release);
+        })
+        .unwrap();
+
+        let _ = guard.0[1].send(());
+        let started = Instant::now();
+        while !shared_ran.load(Ordering::Acquire) {
+            if started.elapsed() > Duration::from_secs(2) {
+                panic!("общую задачу не украли");
+            }
+            thread::yield_now();
+        }
+        assert!(
+            !pinned_ran.load(Ordering::Acquire),
+            "закреплённую задачу забрал сосед"
+        );
         drop(guard);
     }
 }

@@ -4,9 +4,9 @@
 
 ## English
 
-`warm_core` is a small thread pool for Linux that tries not to shuffle data between CPU cores. Each worker thread is pinned to its own physical core, and every task runs from start to finish in one place. As a result, the data a task works on settles into that core's fast caches (L1 and L2) and stays there until the task is done.
+`warm_core` is a small thread pool for Linux that tries not to shuffle data between CPU cores. Each worker thread is pinned to its own physical core, and a task, once a worker starts it, runs to completion there. `execute_on` keeps the task on the core whose L1 and L2 already hold its data. `execute` may place it on another core, and an idle neighbour may steal it, so that call does not promise a particular core's cache.
 
-The pool discovers the CPU layout on its own from `/sys/devices/system/cpu`: how many physical cores there are, which logical CPUs share a core, and how large the caches are. Threads are pinned with the `sched_setaffinity` system call. The only external dependency is `libc`.
+The pool discovers the CPU layout on its own from `/sys/devices/system/cpu` and `/sys/devices/system/node`: how many physical cores there are, which logical CPUs share a core, how large the caches are, and which NUMA node each CPU belongs to. CPUs outside the process cpuset are left out, so a container does not grow a worker it is not allowed to run. Threads are pinned with `sched_setaffinity`. New allocations on a worker prefer that CPU's NUMA node: the pin alone does not place memory. The only external dependency is `libc`.
 
 The sections below cover, in order: a bit of background on cores and caches, how the pool works, how to use it, and what the benchmark showed.
 
@@ -22,7 +22,7 @@ On an Intel i7-8750H, the same workload took:
 
 The affinity mask by itself did not shorten the work: pinned Rayon came out at **0.95×**. `warm_core` finished about **1.4× faster** than unpinned Rayon, 11 ms less, and it was also faster than the pinned Rayon pool. All three variants produced identical checksums, so they really did the same work. Details and caveats are in [What the benchmark shows](#what-the-benchmark-shows).
 
-`cargo test` passes: 20 library tests and 1 doctest.
+`cargo test` passes: 29 library tests and 1 doctest.
 
 ### Background
 
@@ -74,13 +74,15 @@ A regular program cannot stop the operating system from preempting its threads. 
 
 When you call `Pool::new()`:
 
-1. The topology is read from `/sys/devices/system/cpu`: the physical core of every logical CPU, its hyper-threading siblings, and the cache parameters.
-2. By default, **one worker thread per physical core** is started, not one per logical CPU. On the i7-8750H that is 6 threads on CPUs `0–5`. The other halves of the pairs (`6–11`) are left alone: two pool threads on the same core would share L1 and L2 and evict each other's data.
-3. Each worker is pinned to a single logical CPU via `sched_setaffinity` (`pin_to`), so the scheduler no longer moves it to other cores. The system can still preempt it temporarily for another process, and other programs can still use the idle hyper-threading sibling — the pool does not control that.
+1. The topology is read from `/sys/devices/system/cpu` and `/sys/devices/system/node`: the physical core of every logical CPU, its hyper-threading siblings, the cache parameters, and the NUMA node. CPUs missing from the process cpuset are dropped. A CPU whose NUMA node is outside `cpuset.mems` is dropped too, when that still leaves a CPU to run on.
+2. By default, **one worker thread per physical core** is started, not one per logical CPU. On the i7-8750H that is 6 threads on CPUs `0–5`. The other halves of the pairs (`6–11`) are left alone: two pool threads on the same core would share L1 and L2 and evict each other's data. If the cpuset only contains the other half of a pair, the worker is pinned to that half.
+3. Each worker is pinned to a single logical CPU via `sched_setaffinity` (`pin_to`), so the scheduler no longer moves it to other cores. It then prefers its NUMA node for new anonymous pages (`set_mempolicy`). Pages already allocated on another node stay there: the pin does not migrate them. The system can still preempt the thread for another process, and other programs can still use the idle hyper-threading sibling.
 4. Each worker has two task queues:
    - a **shared** queue for `execute`; other workers may take tasks from it;
    - a **pinned** queue for `execute_on`; these tasks run only on their own core.
 5. Each queue is a ring buffer of 4096 tasks based on Dmitry Vyukov's algorithm. Several threads can push and pop at the same time. The write and read positions live on separate cache lines, and each slot occupies its own line as well. Without that, every push would dirty the line the worker is reading at that moment, and cores would bounce it back and forth. This is called false sharing: the data is logically independent but physically sits in one line.
+
+How the cpuset is found, and why a pin does not place memory, is written up in [LOCALITY.md](LOCALITY.md).
 
 Each worker then runs a simple loop:
 
@@ -94,9 +96,9 @@ The quota, and why the count has to survive a batch boundary, is written up in [
 
 ### Life of a task
 
-`execute` puts the task into the shared queue of the core that currently has the fewest tasks. On a tie, cores are picked round-robin so that work does not pile up on core zero. If that queue is full, the other cores are tried too. If another core becomes idle first, it may take the task.
+`execute` puts the task into the shared queue of the core that currently has the fewest tasks. On a tie it prefers the NUMA node of the calling thread, then round-robin, so work does not pile up on core zero and the task stays next to memory that thread already touched. If that queue is full, the other cores are tried too. If another core becomes idle first, it may take the task. A buffer warmed on one core is therefore not guaranteed to be scanned there again.
 
-`execute_on(core, ...)` puts the task into the pinned queue of the given physical core, and that is where it runs. In `LogicalCpus` mode, where a core has two workers, both pinned queues are tried, least loaded first.
+`execute_on(core, ...)` puts the task into the pinned queue of the given physical core, and that is where it runs. An idle neighbour does not steal it. Calling it again with the same core keeps the working set in that core's L1 and L2. In `LogicalCpus` mode, where a core has two workers, both pinned queues are tried, least loaded first.
 
 Both calls return a `JobHandle`, so the calling thread can keep working. The result is retrieved with `wait()`, which blocks until the task finishes. Each queue holds 4096 tasks. When every queue the call may use is full, `execute` and `execute_on` sleep until a slot appears, but no longer than `Config::submit_timeout` (one second by default), and then return `PoolError::QueueFull`. `try_execute` and `try_execute_on` do not sleep: a full queue is an immediate `QueueFull`. The closure has already been moved into the call, so on `QueueFull` it is dropped and the task never starts. How the wait is bounded, and why a full queue sleeps on a futex, is written up in [BACKPRESSURE.md](BACKPRESSURE.md).
 
@@ -196,6 +198,7 @@ Important caveats:
 - Each task allocates its buffer on the worker that runs it and then scans that buffer 40 times without yielding. A pin and a local queue are doing different jobs here. The Rayon pair is the pin. The shorter `warm_core` time is how the 24 tasks are handed out.
 - This is a single short run on a single machine. On a different processor, with different cache sizes, or under background load the numbers will differ, so 1.4 and 0.95 are not guaranteed results.
 - A pin pays off when the kernel would otherwise move a busy thread to another core. This run did not show that cost. Keeping a cache warm matters when the same bytes are scanned many times and something else would evict them between passes. A single streaming pass over memory has little to gain from either.
+- These tasks call `execute` and allocate the buffer inside the task. The first touch happens on whichever worker runs it, and a later task is a new buffer. The run does not show a working set that already lives on one core. That measurement is `examples/stateful.rs`.
 
 To reproduce:
 
@@ -223,9 +226,19 @@ cargo bench
 
 It uses 8 passes instead of 40, and the number of tasks is derived from `available_parallelism()`. The three functions are `rayon`, `rayon_affinity`, and `warm_core`. Criterion repeats the runs and estimates the spread. The example in `examples/` is easier to read; the benchmark gives more reliable numbers.
 
+### Stateful working set
+
+`examples/stateful.rs` keeps one L2-sized buffer per core. It faults the buffer with `execute_on`, then repeats the scan. `execute_on` stays on that core. `execute` goes through the shared queue, which an idle neighbour may steal, so the same bytes are not promised to that core's L1 and L2.
+
+The example prints p50 and p99 of the time spent inside the task, not the time spent waiting in the queue. L1d and last-level load misses come from `perf_event_open` on each worker thread. If the kernel refuses the counters, the latencies are still printed. The figures belong to the machine they were measured on. `cargo test` does not assert them.
+
+```bash
+cargo run --release --example stateful
+```
+
 ### Tests
 
-`cargo test` runs 20 library tests and the doc example in `src/lib.rs`.
+`cargo test` runs 29 library tests and the doc example in `src/lib.rs`.
 
 Queue:
 
@@ -248,40 +261,49 @@ Pool:
 - `try_execute_on` returns `UnknownCore` for a missing core and `QueueFull` when that core's pinned queue is full;
 - the waiter count and the futex word sit on different cache lines;
 - a wait ends when its timeout expires;
-- freeing a slot wakes a thread that is waiting for one.
+- freeing a slot wakes a thread that is waiting for one;
+- an idle neighbour runs a shared task and does not run a pinned task queued beside it.
 
 Topology and pinning:
 
 - CPU lists such as `0,6` and `0-3,8` are parsed;
 - cache sizes such as `32K`, `256K`, `9M` are parsed;
 - on the current machine the cache line size is a power of two, and each physical core gets at most one worker;
-- `sched_setaffinity` really narrows the thread's mask down to one CPU.
+- `sched_setaffinity` really narrows the thread's mask down to one CPU;
+- a cgroup v2 cpuset is read from the ancestor that actually has `cpuset.cpus.effective`, and a hybrid v1+v2 setup intersects the two lists;
+- NUMA nodes come from `nodeN/cpulist`;
+- a cpuset that only contains one hyper-thread keeps that thread as the worker for its core;
+- CPUs on a memory node outside `cpuset.mems` are dropped when another node is still usable;
+- `set_mempolicy` accepts the node the thread is running on.
 
 ### Project layout
 
 | File | Contents |
 |---|---|
-| `src/topology.rs` | Reads cores, hyper-threading pairs and caches from `/sys` |
-| `src/affinity.rs` | Pins a thread to a single CPU (`pin_to`) |
+| `src/topology.rs` | Reads cores, SMT pairs, caches and NUMA nodes from `/sys`, then drops CPUs outside the cpuset |
+| `src/affinity.rs` | Pins a thread to a single CPU (`pin_to`) and prefers that CPU's NUMA node for new pages |
+| `src/cpuset.rs` | Reads the process cpuset: allowed CPUs and memory nodes |
 | `src/queue.rs` | Task queue with positions on separate cache lines |
 | `src/gate.rs` | Bounded sleep until a queue slot is free, without a lock on every pop |
 | `src/pool.rs` | The pool itself: two queues per core, batched execution, `execute`, `try_execute`, and `execute_on` |
 | `examples/compare.rs` | Rayon with and without affinity, plus `warm_core` |
+| `examples/stateful.rs` | `execute_on` against `execute` on one buffer per core: in-task p99 and cache misses |
 | `benches/locality.rs` | The same comparison using criterion |
 | `BENCHMARK.md` | Why the comparison changed, and what the run showed |
 | `QUEUE.md` | Why `len` grows before a slot is published, and how Loom checks it |
 | `FAIRNESS.md` | Why a steady pinned load leaves a slot for the shared queue |
 | `BACKPRESSURE.md` | Why a full queue sleeps for a bounded time instead of spinning |
+| `LOCALITY.md` | Why the pool drops CPUs outside the cpuset, and why a pin does not place memory |
 
 ### Limitations
 
-The crate works on Linux only: it needs `/sys/devices/system/cpu` and `sched_setaffinity`. The topology is read once when the pool is created. If the process runs with a restricted CPU set (for example via `taskset` or cgroups) and the pool tries to pin a worker to an unavailable CPU, `Pool::new()` returns an error.
+The crate works on Linux only: it needs `/sys/devices/system/cpu` and `sched_setaffinity`. When cgroup files are mounted, it also reads the process cpuset. The topology is read once when the pool is created. If that cpuset leaves no CPU, `Pool::new()` returns an error. `set_mempolicy` is best-effort: a sandbox that rejects it still starts the pool. `taskset` on the calling thread does not shrink the pool, because workers may widen their affinity back to the whole cpuset. A warm L1/L2 for a particular buffer is what `execute_on` provides. `execute` may move the task, including by work stealing.
 
 ## Русский
 
-`warm_core` — небольшой пул потоков для Linux, который старается не гонять данные между ядрами процессора. Каждый рабочий поток закреплён за своим физическим ядром, и задача от начала до конца выполняется на одном месте. Поэтому данные, с которыми она работает, успевают осесть в быстрых кэшах этого ядра (L1 и L2) и остаются там, пока задача не закончится.
+`warm_core` — небольшой пул потоков для Linux, который старается не гонять данные между ядрами процессора. Каждый рабочий поток закреплён за своим физическим ядром, и задача, которую он начал, дорабатывается на нём до конца. `execute_on` оставляет задачу на ядре, в чьих L1 и L2 её данные уже лежат. `execute` может положить её на другое ядро, а простаивающий сосед — украсть, поэтому кэш конкретного ядра этот вызов не обещает.
 
-Пул сам узнаёт устройство процессора из `/sys/devices/system/cpu`: сколько физических ядер, какие логические CPU делят одно ядро, какого размера кэши. Потоки привязываются к ядрам системным вызовом `sched_setaffinity`. Из внешних зависимостей только `libc`.
+Пул сам узнаёт устройство процессора из `/sys/devices/system/cpu` и `/sys/devices/system/node`: сколько физических ядер, какие логические CPU делят одно ядро, какого размера кэши и к какому узлу NUMA относится каждый CPU. CPU вне cpuset процесса не занимаются, поэтому контейнер не получает worker, которому запрещено исполняться. Потоки привязываются вызовом `sched_setaffinity`. Новые выделения на worker предпочитают узел NUMA этого CPU: сама привязка память не размещает. Из внешних зависимостей только `libc`.
 
 Ниже по порядку: немного теории про ядра и кэши, как устроен пул, как им пользоваться и что показал замер.
 
@@ -297,7 +319,7 @@ The crate works on Linux only: it needs `/sys/devices/system/cpu` and `sched_set
 
 Сама маска affinity работу не сократила: привязанный Rayon показал **0.95×**. `warm_core` справился примерно в **1.4 раза быстрее** непривязанного Rayon, на 11 мс меньше, и обогнал привязанный Rayon тоже. Все три варианта посчитали одинаковые контрольные суммы, так что работа действительно одна и та же. Подробности замера и оговорки к нему — в разделе [«Что показал замер»](#что-показал-замер).
 
-`cargo test` проходит: 20 тестов библиотеки и 1 doctest.
+`cargo test` проходит: 29 тестов библиотеки и 1 doctest.
 
 ### Немного теории
 
@@ -349,13 +371,15 @@ The crate works on Linux only: it needs `/sys/devices/system/cpu` and `sched_set
 
 При вызове `Pool::new()` происходит следующее:
 
-1. Из `/sys/devices/system/cpu` читается топология: номер физического ядра у каждого логического CPU, его соседи по hyper-threading и параметры кэшей.
-2. По умолчанию запускается **по одному рабочему потоку на физическое ядро**, а не на каждый логический CPU. На i7-8750H это 6 потоков на CPU `0–5`. Вторые половины пар (`6–11`) пул не занимает: два потока пула на одном ядре делили бы L1 и L2 и вытесняли бы данные друг друга.
-3. Каждый рабочий поток привязывается к одному логическому CPU через `sched_setaffinity` (`pin_to`), и планировщик больше не переносит его на другие ядра. Вытеснить его на время другим процессом система по-прежнему может, и свободный «сосед» по hyper-threading тоже могут занять другие программы — пул этим не управляет.
+1. Из `/sys/devices/system/cpu` и `/sys/devices/system/node` читается топология: номер физического ядра у каждого логического CPU, его соседи по hyper-threading, параметры кэшей и узел NUMA. CPU, которых нет в cpuset процесса, отбрасываются. CPU, чей узел не входит в `cpuset.mems`, тоже отбрасывается, если после этого ещё есть где исполняться.
+2. По умолчанию запускается **по одному рабочему потоку на физическое ядро**, а не на каждый логический CPU. На i7-8750H это 6 потоков на CPU `0–5`. Вторые половины пар (`6–11`) пул не занимает: два потока пула на одном ядре делили бы L1 и L2 и вытесняли бы данные друг друга. Если cpuset оставил только вторую половину пары, worker сажается на неё.
+3. Каждый рабочий поток привязывается к одному логическому CPU через `sched_setaffinity` (`pin_to`), и планировщик больше не переносит его на другие ядра. Затем поток предпочитает узел NUMA этого CPU для новых анонимных страниц (`set_mempolicy`). Страницы, уже выделенные на другом узле, остаются там: привязка их не переносит. Вытеснить поток на время другим процессом система по-прежнему может, и свободный «сосед» по hyper-threading тоже могут занять другие программы.
 4. У каждого рабочего потока две очереди задач:
    - **общая** — для `execute`; из неё задачи может забрать другой поток;
    - **закреплённая** — для `execute_on`; эти задачи выполняются только на своём ядре.
 5. Каждая очередь — кольцевой буфер на 4096 задач по алгоритму Дмитрия Вьюкова. Класть и забирать задачи могут сразу несколько потоков. Позиции записи и чтения лежат на разных кэш-линиях, и каждый слот тоже занимает свою линию. Без этого каждое добавление задачи портило бы линию, которую рабочий поток в этот момент читает, и ядра перебрасывали бы её друг другу. Это называется false sharing: данные логически независимы, но физически лежат в одной линии.
+
+Как находится cpuset и почему привязка потока не размещает память, разобрано в [LOCALITY.md](LOCALITY.md).
 
 Дальше рабочий поток живёт в простом цикле:
 
@@ -369,9 +393,9 @@ The crate works on Linux only: it needs `/sys/devices/system/cpu` and `sched_set
 
 ### Путь одной задачи
 
-`execute` кладёт задачу в общую очередь ядра, у которого сейчас меньше всего задач. При равенстве ядра выбираются по кругу, чтобы всё не скапливалось на нулевом. Если эта очередь полна, пробуются и остальные ядра. Если какое-то ядро освободится раньше, оно может забрать эту задачу себе.
+`execute` кладёт задачу в общую очередь ядра, у которого сейчас меньше всего задач. При равенстве сначала выбирается узел NUMA вызывающего потока, и только потом круг, чтобы задачи не скапливались на нулевом ядре и оставались рядом с памятью, которую этот поток уже трогал. Если эта очередь полна, пробуются и остальные ядра. Если какое-то ядро освободится раньше, оно может забрать эту задачу себе. Буфер, прогретый на одном ядре, следующий вызов не обязан прочитать там же.
 
-`execute_on(core, ...)` кладёт задачу в закреплённую очередь указанного физического ядра. Там она и будет выполнена. В режиме `LogicalCpus`, где на ядре два рабочих потока, пробуются обе закреплённые очереди, сначала у менее загруженного.
+`execute_on(core, ...)` кладёт задачу в закреплённую очередь указанного физического ядра. Там она и будет выполнена: простаивающий сосед её не крадёт. Повторный вызов с тем же ядром держит рабочий набор в L1 и L2 этого ядра. В режиме `LogicalCpus`, где на ядре два рабочих потока, пробуются обе закреплённые очереди, сначала у менее загруженного.
 
 Оба вызова возвращают `JobHandle`, и вызывающий поток может продолжать работу. Результат забирается через `wait()`, который ждёт завершения задачи. В каждой очереди 4096 задач. Когда все очереди, куда вызов может положить задачу, заполнены, `execute` и `execute_on` спят, пока не появится слот, но не дольше `Config::submit_timeout` (по умолчанию одна секунда), а затем возвращают `PoolError::QueueFull`. `try_execute` и `try_execute_on` не спят: полная очередь — это сразу `QueueFull`. Замыкание к этому моменту уже передано вызову, поэтому при `QueueFull` оно уничтожается и задача не запускается. Как ограничен срок ожидания и почему полная очередь засыпает на futex, разобрано в [BACKPRESSURE.md](BACKPRESSURE.md).
 
@@ -472,6 +496,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - Каждая задача выделяет буфер на том потоке, который её выполняет, и 40 раз проходит по нему, не отдавая процессор. Привязка и локальная очередь здесь делают разную работу. Пара Rayon — это привязка. Более короткое время `warm_core` — это то, как раздаются 24 задачи.
 - Это один короткий прогон на одной машине. На другом процессоре, с другими размерами кэшей или под фоновой нагрузкой цифры будут другими, поэтому 1.4 и 0.95 — не гарантированный результат.
 - Привязка окупается, когда ядро системы иначе перенесло бы занятый поток на другое ядро процессора. Этот прогон такой цены не показал. Держать кэш тёплым имеет смысл, когда одни и те же байты читаются много раз и между проходами их кто-то вытесняет. Один сквозной проход по памяти почти ничего не выигрывает ни от привязки, ни от очередей.
+- Эти задачи вызывают `execute` и выделяют буфер внутри задачи. Первое касание происходит на том worker, который её взял, а следующая задача — это уже новый буфер. Прогон не показывает рабочий набор, который уже живёт на одном ядре. Такой замер — `examples/stateful.rs`.
 
 Повторить замер:
 
@@ -499,9 +524,19 @@ cargo bench
 
 Там 8 проходов вместо 40, а число задач считается от `available_parallelism()`. Три функции — `rayon`, `rayon_affinity` и `warm_core`. Criterion сам повторяет прогоны и оценивает разброс. Пример из `examples/` проще читать, а бенчмарк даёт более надёжные цифры.
 
+### Повторно используемый набор
+
+`examples/stateful.rs` держит по одному буферу размера L2 на ядро. Буфер заполняется через `execute_on`, затем скан повторяется. `execute_on` остаётся на этом ядре. `execute` идёт через общую очередь, которую простаивающий сосед может украсть, поэтому те же байты в L1 и L2 этого ядра уже не обещаны.
+
+Пример печатает p50 и p99 времени внутри задачи, а не времени ожидания в очереди. Промахи L1d и кэша последнего уровня читаются через `perf_event_open` на потоке каждого worker. Если ядро отказало в счётчиках, время всё равно печатается. Цифры принадлежат той машине, на которой их сняли. `cargo test` порог по ним не проверяет.
+
+```bash
+cargo run --release --example stateful
+```
+
 ### Тесты
 
-`cargo test` запускает 20 тестов библиотеки и пример из документации в `src/lib.rs`.
+`cargo test` запускает 29 тестов библиотеки и пример из документации в `src/lib.rs`.
 
 Очередь:
 
@@ -524,31 +559,40 @@ cargo bench
 - `try_execute_on` возвращает `UnknownCore` для несуществующего ядра и `QueueFull`, когда закреплённая очередь этого ядра полна;
 - счётчик ожидающих и слово futex лежат на разных кэш-линиях;
 - ожидание заканчивается, когда выходит его срок;
-- освобождение слота будит поток, который этого слота ждёт.
+- освобождение слота будит поток, который этого слота ждёт;
+- простаивающий сосед выполняет общую задачу и не выполняет закреплённую, которая лежит рядом.
 
 Топология и привязка:
 
 - разбираются списки CPU вида `0,6` и `0-3,8`;
 - разбираются размеры кэшей вида `32K`, `256K`, `9M`;
 - на текущей машине размер кэш-линии — степень двойки, и на каждое физическое ядро приходится не больше одного рабочего потока;
-- `sched_setaffinity` действительно сужает маску потока до одного CPU.
+- `sched_setaffinity` действительно сужает маску потока до одного CPU;
+- cpuset cgroup v2 читается у предка, где реально лежит `cpuset.cpus.effective`, а гибрид v1 и v2 пересекает оба списка;
+- узлы NUMA берутся из `nodeN/cpulist`;
+- cpuset, в котором остался только один hyper-thread, сажает worker этого ядра именно на него;
+- CPU чужого узла памяти выбрасываются, если `cpuset.mems` ещё оставляет где исполняться;
+- `set_mempolicy` принимает узел, на котором поток уже исполняется.
 
 ### Структура проекта
 
 | Файл | Что внутри |
 |---|---|
-| `src/topology.rs` | Чтение ядер, пар hyper-threading и кэшей из `/sys` |
-| `src/affinity.rs` | Привязка потока к одному CPU (`pin_to`) |
+| `src/topology.rs` | Чтение ядер, пар SMT, кэшей и узлов NUMA из `/sys`, затем отбрасывание CPU вне cpuset |
+| `src/affinity.rs` | Привязка потока к одному CPU (`pin_to`) и предпочтение узла NUMA этого CPU для новых страниц |
+| `src/cpuset.rs` | Чтение cpuset процесса: разрешённые CPU и узлы памяти |
 | `src/queue.rs` | Очередь задач с позициями на разных кэш-линиях |
 | `src/gate.rs` | Сон до свободного слота очереди, без замка на каждом pop |
 | `src/pool.rs` | Сам пул: две очереди на ядро, выполнение пачками, `execute`, `try_execute` и `execute_on` |
 | `examples/compare.rs` | Rayon с affinity и без неё, плюс `warm_core` |
+| `examples/stateful.rs` | `execute_on` против `execute` на одном буфере на ядро: p99 внутри задачи и промахи кэша |
 | `benches/locality.rs` | То же сравнение на criterion |
 | `BENCHMARK.md` | Почему сравнение поменялось и что показал прогон |
 | `QUEUE.md` | Почему `len` растёт до публикации слота и как это проверяет Loom |
 | `FAIRNESS.md` | Почему постоянный поток закреплённых задач оставляет слот общей очереди |
 | `BACKPRESSURE.md` | Почему полная очередь спит ограниченное время, а не крутится в `yield_now` |
+| `LOCALITY.md` | Почему пул отбрасывает CPU вне cpuset и почему привязка не размещает память |
 
 ### Ограничения
 
-Крейт работает только в Linux: ему нужны `/sys/devices/system/cpu` и `sched_setaffinity`. Топология читается один раз при создании пула. Если процесс запущен с ограниченным набором CPU (например, через `taskset` или cgroups), а пул попытается закрепить поток за недоступным CPU, `Pool::new()` вернёт ошибку.
+Крейт работает только в Linux: ему нужны `/sys/devices/system/cpu` и `sched_setaffinity`. Если смонтированы файлы cgroup, пул читает и cpuset процесса. Топология читается один раз при создании пула. Если в cpuset не осталось ни одного CPU, `Pool::new()` вернёт ошибку. `set_mempolicy` — по возможности: песочница, которая его запрещает, пул всё равно запускает. `taskset` на вызывающем потоке пул не сужает, потому что worker может расширить свою маску обратно до всего cpuset. Тёплые L1 и L2 конкретного буфера даёт `execute_on`. `execute` может перенести задачу, в том числе кражей.
