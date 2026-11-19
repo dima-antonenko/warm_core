@@ -7,6 +7,8 @@
 //! задачу в очередь, которую не крадут, и повторный вызов остаётся на этом
 //! ядре. [`Pool::execute`] кладёт её в общую очередь: простаивающий сосед
 //! может забрать задачу, поэтому кэш конкретного ядра этот вызов не обещает.
+//! [`Shard`] оставляет на ядре само значение: чужой поток его не видит и
+//! посылает туда замыкание.
 //!
 //! # Example
 //!
@@ -21,8 +23,10 @@ mod cpuset;
 mod gate;
 mod pool;
 mod queue;
+mod shard;
 mod topology;
 
 pub use affinity::pin_to;
 pub use pool::{Config, JobHandle, Layout, Pool, PoolError};
+pub use shard::Shard;
 pub use topology::{CacheInfo, CoreId, Cpu, Topology};

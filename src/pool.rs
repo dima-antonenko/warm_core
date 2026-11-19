@@ -13,7 +13,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle, Thread};
+use std::thread::{self, JoinHandle, Thread, ThreadId};
 use std::time::{Duration, Instant};
 
 const QUEUE_CAPACITY: usize = 4096;
@@ -57,22 +57,48 @@ impl Default for Config {
 #[derive(Debug)]
 pub enum PoolError {
     UnknownCore(CoreId),
+    /// На ядре больше одного worker. Владельцем состояния может быть только один поток.
+    AmbiguousCore(CoreId),
     /// В очереди не нашлось слота до конца ожидания. Замыкание при этом уничтожается.
     QueueFull,
+    /// [`crate::Shard::call`] вызван повторно, пока внешний `call` ещё держит значение.
+    Reentrant,
+    /// Пул останавливается или уже остановился. Новую работу в очередь не ставим.
+    Stopped,
 }
 
 impl std::fmt::Display for PoolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownCore(core) => write!(f, "в пуле нет ядра {}", core.0),
+            Self::AmbiguousCore(core) => {
+                write!(f, "у ядра {} больше одного worker", core.0)
+            }
             Self::QueueFull => write!(f, "очередь ядра заполнена"),
+            Self::Reentrant => write!(
+                f,
+                "повторный call шарда, пока предыдущий ещё держит значение"
+            ),
+            Self::Stopped => write!(f, "пул уже остановлен"),
         }
     }
 }
 
 impl std::error::Error for PoolError {}
 
-type Task = Box<dyn FnOnce() + Send + 'static>;
+pub(crate) type Task = Box<dyn FnOnce() + Send + 'static>;
+
+/// Значение шарда, которое worker уничтожает на своём потоке при остановке.
+pub(crate) trait ShardSlot: Send + Sync {
+    fn dispose_on_owner(&self);
+    fn addr(&self) -> *const ();
+}
+
+struct ShardList {
+    /// После этого новые слоты не принимаются: worker уже забрал список.
+    closed: bool,
+    slots: Vec<Arc<dyn ShardSlot>>,
+}
 
 struct Worker {
     cpu: usize,
@@ -85,9 +111,12 @@ struct Worker {
     wake: Mutex<Option<Thread>>,
     /// Общий gate закреплённых очередей этого физического ядра.
     pinned_gate: usize,
+    /// Выставляется до сигнала о старте, поэтому после `Pool::new` уже виден.
+    thread_id: Mutex<Option<ThreadId>>,
+    shards: Mutex<ShardList>,
 }
 
-struct Inner {
+pub(crate) struct Inner {
     workers: Vec<Worker>,
     batch: usize,
     pinned_per_shared: usize,
@@ -102,7 +131,7 @@ struct Inner {
 
 /// Пул закреплённых потоков.
 pub struct Pool {
-    inner: Arc<Inner>,
+    pub(crate) inner: Arc<Inner>,
     joins: Vec<JoinHandle<()>>,
 }
 
@@ -171,6 +200,11 @@ impl Pool {
                 shared: Queue::new(QUEUE_CAPACITY),
                 wake: Mutex::new(None),
                 pinned_gate,
+                thread_id: Mutex::new(None),
+                shards: Mutex::new(ShardList {
+                    closed: false,
+                    slots: Vec::new(),
+                }),
             })
             .collect();
 
@@ -481,6 +515,10 @@ fn worker_entry(inner: Arc<Inner>, index: usize, started: Sender<io::Result<()>>
     // привязка уже стоит, а песочница может запрещать set_mempolicy.
     let _ = affinity::prefer_node(node);
     {
+        let mut thread_id = inner.workers[index].thread_id.lock().unwrap();
+        *thread_id = Some(thread::current().id());
+    }
+    {
         let mut wake = inner.workers[index].wake.lock().unwrap();
         *wake = Some(thread::current());
     }
@@ -516,6 +554,9 @@ fn worker_loop(inner: &Inner, index: usize) {
         }
         thread::park();
     }
+    // Очереди уже пусты. Шарды, которые ещё держат снаружи, уничтожаются здесь,
+    // на потоке владельца, а не на том потоке, который уронит последнюю ручку.
+    retire_shards(inner, index, &mut pinned_streak);
 }
 
 /// Своя закреплённая и своя общая очередь делят пачку: `pinned_per_shared`
@@ -594,6 +635,166 @@ fn steal(inner: &Inner, index: usize) -> Option<Task> {
         }
     }
     None
+}
+
+fn drain_local(inner: &Inner, index: usize, pinned_streak: &mut usize) {
+    while run_local_batch(inner, index, pinned_streak) {}
+}
+
+/// Забирает живые шарды и уничтожает их на этом потоке.
+///
+/// `closed` выставляется под тем же замком, под которым чужой `Drop` кладёт
+/// задачу уничтожения. Пустой список значит, что такая задача уже в очереди
+/// или значение уже снято: следующий `drain_local` её доедает.
+fn retire_shards(inner: &Inner, index: usize, pinned_streak: &mut usize) {
+    loop {
+        drain_local(inner, index, pinned_streak);
+        let batch = {
+            let mut list = inner.workers[index].shards.lock().unwrap();
+            if list.slots.is_empty() {
+                list.closed = true;
+                break;
+            }
+            std::mem::take(&mut list.slots)
+        };
+        for slot in batch {
+            slot.dispose_on_owner();
+        }
+    }
+    drain_local(inner, index, pinned_streak);
+}
+
+impl Inner {
+    pub(crate) fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+
+    /// Ровно один worker на это ядро.
+    pub(crate) fn sole_worker(&self, core: CoreId) -> Result<usize, PoolError> {
+        let mut found = None;
+        for (index, worker) in self.workers.iter().enumerate() {
+            if worker.core_id != core {
+                continue;
+            }
+            if found.is_some() {
+                return Err(PoolError::AmbiguousCore(core));
+            }
+            found = Some(index);
+        }
+        found.ok_or(PoolError::UnknownCore(core))
+    }
+
+    pub(crate) fn worker_thread(&self, index: usize) -> Option<ThreadId> {
+        *self.workers[index].thread_id.lock().unwrap()
+    }
+
+    pub(crate) fn register_shard(&self, index: usize, slot: Arc<dyn ShardSlot>) -> bool {
+        let mut list = self.workers[index].shards.lock().unwrap();
+        if list.closed {
+            return false;
+        }
+        list.slots.push(slot);
+        true
+    }
+
+    pub(crate) fn unregister_shard(&self, index: usize, addr: *const ()) {
+        let mut list = self.workers[index].shards.lock().unwrap();
+        list.slots.retain(|slot| slot.addr() != addr);
+    }
+
+    /// Задача в закреплённую очередь одного worker.
+    ///
+    /// С потока этого worker слот не ждём: очередь разбирает только он,
+    /// и ожидание повесило бы его на собственной задаче.
+    pub(crate) fn push_pinned(
+        &self,
+        index: usize,
+        mut task: Task,
+        wait: bool,
+    ) -> Result<(), PoolError> {
+        if self.is_shutdown() {
+            return Err(PoolError::Stopped);
+        }
+        let on_owner = self.worker_thread(index) == Some(thread::current().id());
+        let wait = wait && !on_owner;
+        let deadline = Instant::now() + self.submit_timeout;
+        loop {
+            if self.is_shutdown() {
+                return Err(PoolError::Stopped);
+            }
+            match self.workers[index].pinned.push(task) {
+                Ok(()) => {
+                    unpark_worker(&self.workers[index]);
+                    return Ok(());
+                }
+                Err(returned) => task = returned,
+            }
+            if !wait {
+                return Err(PoolError::QueueFull);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(PoolError::QueueFull);
+            }
+            let gate = self.workers[index].pinned_gate;
+            let registration = self.pinned_gates[gate].register();
+            let expected = registration.generation();
+            match self.workers[index].pinned.push(task) {
+                Ok(()) => {
+                    unpark_worker(&self.workers[index]);
+                    return Ok(());
+                }
+                Err(returned) => task = returned,
+            }
+            registration.wait(expected, deadline.saturating_duration_since(Instant::now()));
+        }
+    }
+
+    /// Задача уничтожения шарда. Ждёт слот, пока worker не закроет список.
+    ///
+    /// Проверка `closed` и `push` идут под одним замком: иначе остановка
+    /// может забрать список между ними и не увидеть уже лежащее значение.
+    pub(crate) fn enqueue_dispose(&self, index: usize, mut task: Task) -> Result<(), Task> {
+        loop {
+            match self.try_push_dispose(index, task) {
+                DisposePush::Queued => {
+                    unpark_worker(&self.workers[index]);
+                    return Ok(());
+                }
+                DisposePush::Closed(task) => return Err(task),
+                DisposePush::Full(returned) => task = returned,
+            }
+            let gate = self.workers[index].pinned_gate;
+            let registration = self.pinned_gates[gate].register();
+            let expected = registration.generation();
+            match self.try_push_dispose(index, task) {
+                DisposePush::Queued => {
+                    unpark_worker(&self.workers[index]);
+                    return Ok(());
+                }
+                DisposePush::Closed(task) => return Err(task),
+                DisposePush::Full(returned) => task = returned,
+            }
+            registration.wait(expected, Duration::from_secs(1));
+        }
+    }
+
+    fn try_push_dispose(&self, index: usize, task: Task) -> DisposePush {
+        let list = self.workers[index].shards.lock().unwrap();
+        if list.closed {
+            return DisposePush::Closed(task);
+        }
+        match self.workers[index].pinned.push(task) {
+            Ok(()) => DisposePush::Queued,
+            Err(task) => DisposePush::Full(task),
+        }
+    }
+}
+
+enum DisposePush {
+    Queued,
+    Closed(Task),
+    Full(Task),
 }
 
 #[cfg(test)]

@@ -106,6 +106,10 @@ If a task panics, the panic is propagated to `wait()`. The worker itself keeps r
 
 When the pool is dropped, it tells the workers to stop, wakes them up, and waits until they finish every task already in their queues.
 
+### State that stays on a core
+
+`execute_on` keeps a task on a core. It does not keep the value: the closure still borrows or owns whatever the caller moved in, and the result comes back on a channel. [`Shard`](src/shard.rs) is the value that does not leave. `shard_on` runs the constructor on that core's only worker, so the first write of the allocation happens there. Another thread never gets `&T`. `call` runs a closure on the owner and waits. `defer` only enqueues one, which is how one core asks another to do something without blocking its own loop. The reply is a `defer` back. A `call` from one worker into another can deadlock if the other side calls back. Two workers on one core (`LogicalCpus`) cannot share a shard. The details are in [OWNERSHIP.md](OWNERSHIP.md).
+
 ### Usage
 
 ```rust
@@ -129,6 +133,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let core = pool.cores()[0];
     let pinned = pool.execute_on(core, || 10)?.wait();
     assert_eq!(pinned, 10);
+
+    // The value stays on this core. The caller only gets back what `call` returns.
+    let shard = pool.shard_on(core, || 0)?;
+    shard.call(|value| *value += 1)?;
+    assert_eq!(shard.call(|value| *value)?, 1);
 
     // A worker on every logical CPU, hyper-threading siblings included.
     let _all_logical = Pool::with_config(Config {
@@ -247,7 +256,7 @@ p50 stays close: many `execute` tasks still find the lines in a nearby cache. p9
 
 ### Tests
 
-`cargo test` runs 29 library tests and the doc example in `src/lib.rs`.
+`cargo test` runs 38 library tests and the doc examples in `src/lib.rs` and `src/shard.rs`.
 
 Queue:
 
@@ -273,6 +282,17 @@ Pool:
 - freeing a slot wakes a thread that is waiting for one;
 - an idle neighbour runs a shared task and does not run a pinned task queued beside it.
 
+Shard:
+
+- `init` and `call` run on the CPU that worker is pinned to, and a later `call` sees the mutation;
+- `T` does not have to be `Send`;
+- `call` from the owner thread runs inline, so it does not wait for a queue that only this thread drains;
+- a nested `call` on the same shard returns `Reentrant`, and the shard still accepts the next call;
+- `defer` from one shard to another runs on the target CPU, and the reply `defer` writes the result back;
+- a missing core and a core with two workers are different errors;
+- a panic inside `call` does not stop the worker;
+- dropping the last handle from another thread, and dropping the pool while a handle is still held, both drop the value on the owner's CPU.
+
 Topology and pinning:
 
 - CPU lists such as `0,6` and `0-3,8` are parsed;
@@ -295,18 +315,21 @@ Topology and pinning:
 | `src/queue.rs` | Task queue with positions on separate cache lines |
 | `src/gate.rs` | Bounded sleep until a queue slot is free, without a lock on every pop |
 | `src/pool.rs` | The pool itself: two queues per core, batched execution, `execute`, `try_execute`, and `execute_on` |
+| `src/shard.rs` | Per-core state: `shard_on`, `call`, and `defer` |
 | `examples/compare.rs` | Rayon with and without affinity, plus `warm_core` |
 | `examples/stateful.rs` | `execute_on` against `execute` on one buffer per core: in-task p99 and cache misses |
+| `examples/shards.rs` | Two cores, each owning a buffer, talking with `defer` |
 | `benches/locality.rs` | The same comparison using criterion |
 | `BENCHMARK.md` | Why the comparison changed, and what the run showed |
 | `QUEUE.md` | Why `len` grows before a slot is published, and how Loom checks it |
 | `FAIRNESS.md` | Why a steady pinned load leaves a slot for the shared queue |
 | `BACKPRESSURE.md` | Why a full queue sleeps for a bounded time instead of spinning |
 | `LOCALITY.md` | Why the pool drops CPUs outside the cpuset, and why a pin does not place memory |
+| `OWNERSHIP.md` | Why a pinned task is not yet per-core state, and how `call` differs from `defer` |
 
 ### Limitations
 
-The crate works on Linux only: it needs `/sys/devices/system/cpu` and `sched_setaffinity`. When cgroup files are mounted, it also reads the process cpuset. The topology is read once when the pool is created. If that cpuset leaves no CPU, `Pool::new()` returns an error. `set_mempolicy` is best-effort: a sandbox that rejects it still starts the pool. `taskset` on the calling thread does not shrink the pool, because workers may widen their affinity back to the whole cpuset. A warm L1/L2 for a particular buffer is what `execute_on` provides. `execute` may move the task, including by work stealing.
+The crate works on Linux only: it needs `/sys/devices/system/cpu` and `sched_setaffinity`. When cgroup files are mounted, it also reads the process cpuset. The topology is read once when the pool is created. If that cpuset leaves no CPU, `Pool::new()` returns an error. `set_mempolicy` is best-effort: a sandbox that rejects it still starts the pool. `taskset` on the calling thread does not shrink the pool, because workers may widen their affinity back to the whole cpuset. A warm L1/L2 for a particular buffer is what `execute_on` provides. `execute` may move the task, including by work stealing. A value that must stay on one core is a [`Shard`](src/shard.rs): other cores reach it only through `call` and `defer`. `call` from one worker into another deadlocks if that worker calls back. This is not a reactor. See [OWNERSHIP.md](OWNERSHIP.md).
 
 ## Русский
 
@@ -412,6 +435,10 @@ The crate works on Linux only: it needs `/sys/devices/system/cpu` and `sched_set
 
 Когда пул уничтожается, он сообщает потокам об остановке, будит их и ждёт, пока они выполнят все задачи, которые уже стоят в очередях.
 
+### Состояние, которое остаётся на ядре
+
+`execute_on` удерживает на ядре задачу, но не значение: замыкание по-прежнему забирает то, что передал вызывающий, а результат возвращается по каналу. [`Shard`](src/shard.rs) — это значение, которое не уезжает. `shard_on` запускает конструктор на единственном worker этого ядра, так что первая запись выделения происходит там. Чужой поток не получает `&T`. `call` выполняет замыкание у владельца и ждёт. `defer` только ставит замыкание в очередь: так одно ядро просит другое что-то сделать и не блокирует свой цикл. Ответ — встречный `defer`. `call` с одного worker на другой зависнет, если тот позовёт обратно. Два worker на одном ядре (`LogicalCpus`) шард не делят. Подробности — в [OWNERSHIP.md](OWNERSHIP.md).
+
 ### Как пользоваться
 
 ```rust
@@ -435,6 +462,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let core = pool.cores()[0];
     let pinned = pool.execute_on(core, || 10)?.wait();
     assert_eq!(pinned, 10);
+
+    // Значение остаётся на этом ядре. Наружу уходит только то, что вернул `call`.
+    let shard = pool.shard_on(core, || 0)?;
+    shard.call(|value| *value += 1)?;
+    assert_eq!(shard.call(|value| *value)?, 1);
 
     // Рабочий поток на каждом логическом CPU, включая пары hyper-threading.
     let _all_logical = Pool::with_config(Config {
@@ -554,7 +586,7 @@ p50 почти не расходится: многие задачи `execute` в
 
 ### Тесты
 
-`cargo test` запускает 29 тестов библиотеки и пример из документации в `src/lib.rs`.
+`cargo test` запускает 38 тестов библиотеки и примеры из документации в `src/lib.rs` и `src/shard.rs`.
 
 Очередь:
 
@@ -580,6 +612,17 @@ p50 почти не расходится: многие задачи `execute` в
 - освобождение слота будит поток, который этого слота ждёт;
 - простаивающий сосед выполняет общую задачу и не выполняет закреплённую, которая лежит рядом.
 
+Шард:
+
+- `init` и `call` идут на том CPU, к которому привязан worker, и следующий `call` видит изменение;
+- `T` не обязан быть `Send`;
+- `call` с потока-владельца выполняется сразу и не ждёт очередь, которую разбирает только этот поток;
+- вложенный `call` того же шарда возвращает `Reentrant`, и следующий `call` шард по-прежнему принимает;
+- `defer` с одного шарда на другой выполняется на CPU адресата, а ответный `defer` дописывает результат владельцу;
+- отсутствующее ядро и ядро с двумя worker — разные ошибки;
+- паника внутри `call` не останавливает worker;
+- и сброс последней ручки с другого потока, и уничтожение пула при живой ручке уничтожают значение на CPU владельца.
+
 Топология и привязка:
 
 - разбираются списки CPU вида `0,6` и `0-3,8`;
@@ -602,15 +645,18 @@ p50 почти не расходится: многие задачи `execute` в
 | `src/queue.rs` | Очередь задач с позициями на разных кэш-линиях |
 | `src/gate.rs` | Сон до свободного слота очереди, без замка на каждом pop |
 | `src/pool.rs` | Сам пул: две очереди на ядро, выполнение пачками, `execute`, `try_execute` и `execute_on` |
+| `src/shard.rs` | Состояние ядра: `shard_on`, `call` и `defer` |
 | `examples/compare.rs` | Rayon с affinity и без неё, плюс `warm_core` |
 | `examples/stateful.rs` | `execute_on` против `execute` на одном буфере на ядро: p99 внутри задачи и промахи кэша |
+| `examples/shards.rs` | Два ядра, у каждого свой буфер, разговор через `defer` |
 | `benches/locality.rs` | То же сравнение на criterion |
 | `BENCHMARK.md` | Почему сравнение поменялось и что показал прогон |
 | `QUEUE.md` | Почему `len` растёт до публикации слота и как это проверяет Loom |
 | `FAIRNESS.md` | Почему постоянный поток закреплённых задач оставляет слот общей очереди |
 | `BACKPRESSURE.md` | Почему полная очередь спит ограниченное время, а не крутится в `yield_now` |
 | `LOCALITY.md` | Почему пул отбрасывает CPU вне cpuset и почему привязка не размещает память |
+| `OWNERSHIP.md` | Почему закреплённая задача ещё не состояние ядра и чем `call` отличается от `defer` |
 
 ### Ограничения
 
-Крейт работает только в Linux: ему нужны `/sys/devices/system/cpu` и `sched_setaffinity`. Если смонтированы файлы cgroup, пул читает и cpuset процесса. Топология читается один раз при создании пула. Если в cpuset не осталось ни одного CPU, `Pool::new()` вернёт ошибку. `set_mempolicy` — по возможности: песочница, которая его запрещает, пул всё равно запускает. `taskset` на вызывающем потоке пул не сужает, потому что worker может расширить свою маску обратно до всего cpuset. Тёплые L1 и L2 конкретного буфера даёт `execute_on`. `execute` может перенести задачу, в том числе кражей.
+Крейт работает только в Linux: ему нужны `/sys/devices/system/cpu` и `sched_setaffinity`. Если смонтированы файлы cgroup, пул читает и cpuset процесса. Топология читается один раз при создании пула. Если в cpuset не осталось ни одного CPU, `Pool::new()` вернёт ошибку. `set_mempolicy` — по возможности: песочница, которая его запрещает, пул всё равно запускает. `taskset` на вызывающем потоке пул не сужает, потому что worker может расширить свою маску обратно до всего cpuset. Тёплые L1 и L2 конкретного буфера даёт `execute_on`. `execute` может перенести задачу, в том числе кражей. Значение, которое должно остаться на одном ядре, — это [`Shard`](src/shard.rs): остальные ядра дотягиваются до него только через `call` и `defer`. `call` с одного worker на другой зависнет, если тот позовёт обратно. Реактора здесь нет. См. [OWNERSHIP.md](OWNERSHIP.md).
