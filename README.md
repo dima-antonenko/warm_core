@@ -228,13 +228,22 @@ It uses 8 passes instead of 40, and the number of tasks is derived from `availab
 
 ### Stateful working set
 
-`examples/stateful.rs` keeps one L2-sized buffer per core. It faults the buffer with `execute_on`, then repeats the scan. `execute_on` stays on that core. `execute` goes through the shared queue, which an idle neighbour may steal, so the same bytes are not promised to that core's L1 and L2.
+`examples/stateful.rs` keeps one L2-sized buffer per core. `execute_on` builds a cycle in that buffer on the core, then the example walks the cycle again. The next index is the value just loaded, so a cache miss stays on the critical path. `execute_on` stays on that core. `execute` goes through the shared queue, which an idle neighbour may steal, so the same bytes are not promised to that core's L1 and L2.
 
 The example prints p50 and p99 of the time spent inside the task, not the time spent waiting in the queue. L1d and last-level load misses come from `perf_event_open` on each worker thread. If the kernel refuses the counters, the latencies are still printed. The figures belong to the machine they were measured on. `cargo test` does not assert them.
 
 ```bash
 cargo run --release --example stateful
 ```
+
+One release run on the Intel i7-8750H (6 cores, 256 KiB of L2, 128 rounds, 32768 dependent steps per task):
+
+| Call | p50 | p99 |
+|---|---:|---:|
+| `execute_on` | 154 µs | 268 µs |
+| `execute` | 159 µs | 485 µs |
+
+p50 stays close: many `execute` tasks still find the lines in a nearby cache. p99 does not. `485 / 268 ≈ 1.8`, and that interval is the walk itself, not the wait in the queue. `perf_event_open` returned `EPERM` because `perf_event_paranoid` is 4, so this run has no miss counts. A kernel that allows the counters will fill those two columns. The latencies are this machine's.
 
 ### Tests
 
@@ -526,13 +535,22 @@ cargo bench
 
 ### Повторно используемый набор
 
-`examples/stateful.rs` держит по одному буферу размера L2 на ядро. Буфер заполняется через `execute_on`, затем скан повторяется. `execute_on` остаётся на этом ядре. `execute` идёт через общую очередь, которую простаивающий сосед может украсть, поэтому те же байты в L1 и L2 этого ядра уже не обещаны.
+`examples/stateful.rs` держит по одному буферу размера L2 на ядро. `execute_on` строит в этом буфере цикл на самом ядре, затем пример обходит цикл снова. Следующий индекс — это только что прочитанное значение, поэтому промах кэша остаётся на критическом пути. `execute_on` остаётся на этом ядре. `execute` идёт через общую очередь, которую простаивающий сосед может украсть, поэтому те же байты в L1 и L2 этого ядра уже не обещаны.
 
 Пример печатает p50 и p99 времени внутри задачи, а не времени ожидания в очереди. Промахи L1d и кэша последнего уровня читаются через `perf_event_open` на потоке каждого worker. Если ядро отказало в счётчиках, время всё равно печатается. Цифры принадлежат той машине, на которой их сняли. `cargo test` порог по ним не проверяет.
 
 ```bash
 cargo run --release --example stateful
 ```
+
+Один прогон `--release` на Intel i7-8750H (6 ядер, L2 256 КБ, 128 раундов, 32768 зависимых шагов на задачу):
+
+| Вызов | p50 | p99 |
+|---|---:|---:|
+| `execute_on` | 154 мкс | 268 мкс |
+| `execute` | 159 мкс | 485 мкс |
+
+p50 почти не расходится: многие задачи `execute` всё ещё находят строки в ближнем кэше. p99 расходится. `485 / 268 ≈ 1.8`, и это время самого обхода, а не ожидания в очереди. `perf_event_open` вернул `EPERM`, потому что `perf_event_paranoid` равен 4, и промахов в этом прогоне нет. Ядро, которое пускает счётчики, заполнит эти две колонки. Время — этой машины.
 
 ### Тесты
 

@@ -46,7 +46,9 @@ A pin keeps the worker on one CPU. It does not keep a shared task on the core th
 
 `execute_on` uses the pinned queue. Repeated calls with the same `CoreId` keep the working set on that core.
 
-`examples/stateful.rs` is that workload. One buffer per core, sized to L2, is faulted with `execute_on`. The example then times many rounds of `execute_on` and of `execute`. It prints p50 and p99 of the time inside the task. L1d and last-level read misses come from `perf_event_open` opened on each worker thread, so the counters follow the thread that runs the scan, including a stolen task. A kernel that returns `EPERM` still leaves the latencies. The numbers are this machine's. Nothing in `cargo test` asserts them.
+`examples/stateful.rs` is that workload. One buffer per core, sized to L2, is turned into a cycle by `execute_on` on that core. Each later task walks the cycle, and the next index is the value just loaded, so a miss is not hidden by the prefetcher. The example times many rounds of `execute_on` and of `execute`. It prints p50 and p99 of the time inside the task. L1d and last-level read misses come from `perf_event_open` opened on each worker thread, so the counters follow the thread that walks the buffer, including a stolen task. A kernel that returns `EPERM` — `perf_event_paranoid` of 3 or more refuses an unprivileged open — still leaves the latencies. The numbers are this machine's. Nothing in `cargo test` asserts them.
+
+On the Intel i7-8750H one release run (128 rounds, a 256 KiB cycle, 32768 dependent steps) gave `execute_on` a p99 of 268 µs and `execute` a p99 of 485 µs. The medians were 154 µs and 159 µs. `perf_event_open` was refused (`perf_event_paranoid` is 4), so that run has latencies and no miss counts.
 
 `pool::tests::pinned_task_is_not_stolen_while_a_shared_one_is` blocks every worker, queues a shared task and a pinned task on worker 0, and releases only a neighbour. The neighbour runs the shared task. The pinned task has not run yet.
 
@@ -126,7 +128,9 @@ The rest of the library tests run with `cargo test`. The example prints this mac
 
 `execute_on` использует закреплённую очередь. Повторные вызовы с тем же `CoreId` оставляют рабочий набор на этом ядре.
 
-`examples/stateful.rs` — эта нагрузка. По одному буферу размера L2 на ядро заполняется через `execute_on`. Дальше пример много раз меряет и `execute_on`, и `execute`. Печатаются p50 и p99 времени внутри задачи. Промахи чтения L1d и кэша последнего уровня берутся из `perf_event_open`, открытого на потоке каждого worker, поэтому счётчик следует за потоком, который сканирует буфер, в том числе за украденной задачей. Если ядро вернёт `EPERM`, время всё равно останется. Цифры — этой машины. `cargo test` порог по ним не проверяет.
+`examples/stateful.rs` — эта нагрузка. По одному буферу размера L2 на ядро `execute_on` превращает в цикл прямо на этом ядре. Каждая следующая задача обходит цикл, и следующий индекс — только что прочитанное значение, поэтому предвыборка промах не прячет. Дальше пример много раз меряет и `execute_on`, и `execute`. Печатаются p50 и p99 времени внутри задачи. Промахи чтения L1d и кэша последнего уровня берутся из `perf_event_open`, открытого на потоке каждого worker, поэтому счётчик следует за потоком, который обходит буфер, в том числе за украденной задачей. Если ядро вернёт `EPERM` — при `perf_event_paranoid` от 3 и выше непривилегированный open запрещён — время всё равно останется. Цифры — этой машины. `cargo test` порог по ним не проверяет.
+
+На Intel i7-8750H один прогон `--release` (128 раундов, цикл 256 КБ, 32768 зависимых шагов) дал `execute_on` p99 268 мкс, а `execute` — 485 мкс. Медианы были 154 мкс и 159 мкс. `perf_event_open` ядро запретило (`perf_event_paranoid` равен 4), поэтому в прогоне есть время и нет промахов.
 
 `pool::tests::pinned_task_is_not_stolen_while_a_shared_one_is` блокирует каждого worker, кладёт общую и закреплённую задачи на worker 0 и отпускает только соседа. Сосед выполняет общую. Закреплённая к этому моменту не выполнялась.
 

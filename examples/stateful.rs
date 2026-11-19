@@ -1,9 +1,10 @@
 //! Один и тот же буфер на ядре: `execute_on` против `execute`.
 //!
-//! Буфер размера L2 прогревается через `execute_on`, затем много раз
-//! сканируется снова. `execute_on` оставляет задачу на этом ядре.
-//! `execute` кладёт её в общую очередь, и сосед может её украсть, поэтому
-//! строки буфера на прежнем ядре уже не обещаны.
+//! Буфер размера L2 заполняется циклом через `execute_on`, затем много раз
+//! обходится снова. Следующий индекс читается из только что загруженной
+//! ячейки, поэтому предвыборка не прячет промах. `execute_on` оставляет
+//! задачу на этом ядре. `execute` кладёт её в общую очередь, и сосед может
+//! её украсть, поэтому строки буфера на прежнем ядре уже не обещаны.
 //!
 //! Печатается время внутри задачи (p50 и p99), не время ожидания в очереди.
 //! Промахи L1d и LLC читаются через `perf_event_open` на потоке каждого
@@ -16,12 +17,11 @@ use std::time::Instant;
 use warm_core::{CoreId, Pool, Topology};
 
 const WARMUP_ROUNDS: usize = 2;
-const ROUNDS: usize = 64;
-const PASSES: usize = 4;
+const ROUNDS: usize = 128;
 
 struct Buffer {
     core: CoreId,
-    bytes: Vec<u8>,
+    bytes: Vec<u64>,
 }
 
 struct Phase {
@@ -37,19 +37,22 @@ fn main() {
         .ok()
         .and_then(|topology| topology.l2_size_bytes())
         .unwrap_or(256 * 1024) as usize;
+    let slots = (bytes / 8).max(2);
     let cores = pool.cores();
     println!(
-        "ядер: {}, буфер: {} КБ, проходов: {PASSES}, раундов: {ROUNDS}",
+        "ядер: {}, буфер: {} КБ, шагов на задачу: {slots}, раундов: {ROUNDS}",
         cores.len(),
-        bytes / 1024,
+        (slots * 8) / 1024,
     );
-    println!("время — внутри задачи, от начала скана до его конца");
+    println!("время — внутри задачи, от начала обхода до его конца");
 
-    let buffers = warm(&pool, &cores, bytes);
+    let buffers = warm(&pool, &cores, slots);
     let counters = match attach(&pool, &cores) {
         Ok(counters) => Some(counters),
         Err(err) => {
-            println!("счётчики недоступны ({err}). Время ниже всё равно посчитано.");
+            println!(
+                "счётчики недоступны ({err}). При perf_event_paranoid >= 3 ядро не даёт их обычному пользователю. Время ниже всё равно посчитано."
+            );
             None
         }
     };
@@ -69,19 +72,21 @@ fn main() {
     );
     print_row("execute_on", &pinned_samples, pinned_misses);
     print_row("execute", &shared_samples, shared_misses);
-    println!("контрольная сумма: {:#x}", pinned_sum ^ shared_sum);
+    assert_eq!(
+        pinned_sum, shared_sum,
+        "оба вызова должны обойти одни и те же буферы"
+    );
+    println!("контрольная сумма: {pinned_sum:#x}");
 }
 
-fn warm(pool: &Pool, cores: &[CoreId], bytes: usize) -> Vec<Buffer> {
+fn warm(pool: &Pool, cores: &[CoreId], slots: usize) -> Vec<Buffer> {
     let mut handles = Vec::with_capacity(cores.len());
     for (index, core) in cores.iter().copied().enumerate() {
-        let mut buf = vec![index as u8; bytes];
+        let mut buf = vec![0u64; slots];
         handles.push((
             core,
             pool.execute_on(core, move || {
-                for _ in 0..PASSES {
-                    scan(&mut buf);
-                }
+                init_cycle(&mut buf, index as u64);
                 buf
             })
             .expect("слот"),
@@ -124,13 +129,10 @@ fn replay(
     let mut checksum = 0u64;
     for _ in 0..rounds {
         let mut handles = Vec::with_capacity(buffers.len());
-        for Buffer { core, mut bytes } in buffers {
+        for Buffer { core, bytes } in buffers {
             let job = move || {
                 let started = Instant::now();
-                let mut acc = 0u64;
-                for _ in 0..PASSES {
-                    acc ^= scan(&mut bytes);
-                }
+                let acc = chase(&bytes);
                 (core, bytes, started.elapsed().as_nanos(), acc)
             };
             let handle = if pinned {
@@ -143,7 +145,7 @@ fn replay(
         buffers = Vec::with_capacity(handles.len());
         for handle in handles {
             let (core, bytes, nanos, acc) = handle.wait();
-            checksum ^= acc;
+            checksum = checksum.wrapping_add(acc);
             if record {
                 samples.push(nanos);
             }
@@ -158,12 +160,27 @@ fn replay(
     }
 }
 
-fn scan(buf: &mut [u8]) -> u64 {
+fn init_cycle(buf: &mut [u64], seed: u64) {
+    let n = buf.len();
+    let mut order: Vec<usize> = (0..n).collect();
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    for i in (1..n).rev() {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let j = (state >> 33) as usize % (i + 1);
+        order.swap(i, j);
+    }
+    for i in 0..n {
+        buf[order[i]] = order[(i + 1) % n] as u64;
+    }
+}
+
+fn chase(buf: &[u64]) -> u64 {
     let buf = std::hint::black_box(buf);
+    let mut index = 0usize;
     let mut acc = 0u64;
-    for byte in buf.iter_mut() {
-        *byte = byte.wrapping_add(1);
-        acc = acc.wrapping_add(u64::from(*byte));
+    for _ in 0..buf.len() {
+        index = buf[index] as usize;
+        acc = acc.wrapping_add(index as u64);
     }
     std::hint::black_box(acc)
 }
